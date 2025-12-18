@@ -39,7 +39,7 @@ def load_harbor_dataset(name: str, version: str) -> list[harbor_task.Task]:
     ]
 
 
-class HarborEnv(base.BaseEnv[harbor_task.Task]):
+class HarborEnv(base.CodeBaseEnv[harbor_task.Task]):
     def __init__(
         self,
         tasks: Sequence[harbor_task.Task],
@@ -97,10 +97,7 @@ class HarborEnv(base.BaseEnv[harbor_task.Task]):
 
         _LOGGER.debug("[%d] Running tests and evaluating.", id(self))
         test_path = str(
-            pathlib.Path("/tests")
-            / self._current_task.paths.test_path.relative_to(
-                self._current_task.paths.tests_dir
-            )
+            pathlib.Path("/tests") / self._current_task.paths.test_path.relative_to(self._current_task.paths.tests_dir)
         )
         # TODO: Log the output of the test execution somewhere that makes sense
         test_result = await self._container.exec_run(command=f"bash {test_path}")
@@ -126,9 +123,7 @@ class HarborEnv(base.BaseEnv[harbor_task.Task]):
     async def _parse_reward_file(self, remote_path: pathlib.Path | str) -> float | None:
         """Helper to parse a reward from a text or json file in the container."""
         remote_path = str(remote_path)
-        cat_result = await self._container.exec_run(
-            command=f"cat {remote_path}"
-        )
+        cat_result = await self._container.exec_run(command=f"cat {remote_path}")
         if cat_result.exit_code != 0:
             # File doesn't exist
             return None

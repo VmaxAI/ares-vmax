@@ -5,15 +5,16 @@ SWE dm_env Environment implementation.
 import abc
 import asyncio
 import atexit
-import dataclasses
 import functools
 import logging
 import os
 import pathlib
 import time
 from types import TracebackType
-from typing import Literal, cast
+from typing import Literal, NamedTuple, Protocol, Self
 import uuid
+
+from numpy.typing import NDArray
 
 from ares.code_agents import code_agent_base
 from ares.code_agents import llms
@@ -30,14 +31,170 @@ os.environ["DOCKER_HOST"] = "unix:///var/run/docker.sock"
 
 
 StepType = Literal["FIRST", "MID", "LAST"]
+NestedScalar = dict[str, "Scalar"] | list["Scalar"] | tuple["Scalar", ...]
+Scalar = float | NDArray | NestedScalar
 
 
-@dataclasses.dataclass(frozen=True, kw_only=True)
-class TimeStep[ObservationType]:
+class TimeStep[ObservationType, RewardType: Scalar, DiscountType: Scalar](NamedTuple):
+    """Returned with every call to `step` and `reset` on an environment.
+
+    A `TimeStep` contains the data emitted by an environment at each step of
+    interaction. A `TimeStep` holds a `step_type`, an `observation` (typically a
+    NumPy array or a dict or list of arrays), and an associated `reward` and
+    `discount`.
+
+    The first `TimeStep` in a sequence will have `FIRST` step type. The final
+    `TimeStep` will have `LAST` step type. All other `TimeStep`s in a sequence will
+    have `MID` step type.
+
+    Attributes:
+      step_type: A `StepType` literal value, FIRST, MID, or LAST.
+      reward:  A scalar, NumPy array, nested dict, list or tuple of rewards; or
+        `None` if `step_type` is `StepType.FIRST`, i.e. at the start of a
+        sequence.
+      discount: A scalar, NumPy array, nested dict, list or tuple of discount
+        values in the range `[0, 1]`, or `None` if `step_type` is
+        `StepType.FIRST`, i.e. at the start of a sequence.
+      observation: A NumPy array, or a nested dict, list or tuple of arrays.
+        Scalar values that can be cast to NumPy arrays (e.g. Python floats) are
+        also valid in place of a scalar array.
+    """
+
     step_type: StepType
-    reward: float
-    discount: float
+    reward: RewardType | None
+    discount: DiscountType | None
     observation: ObservationType
+
+    def first(self) -> bool:
+        return self.step_type == "FIRST"
+
+    def mid(self) -> bool:
+        return self.step_type == "MID"
+
+    def last(self) -> bool:
+        return self.step_type == "LAST"
+
+
+class Environment[ActionType, ObservationType, RewardType: Scalar, DiscountType: Scalar](Protocol):
+    async def reset(self) -> TimeStep[ObservationType, RewardType, DiscountType]:
+        """Starts a new sequence and returns the first `TimeStep` of this sequence.
+
+        Returns:
+          A `TimeStep` namedtuple containing:
+            step_type: A `StepType` of `FIRST`.
+            reward: `None`, indicating the reward is undefined.
+            discount: `None`, indicating the discount is undefined.
+            observation: A NumPy array, or a nested dict, list or tuple of arrays.
+              Scalar values that can be cast to NumPy arrays (e.g. Python floats)
+              are also valid in place of a scalar array. Must conform to the
+              specification returned by `observation_spec()`.
+        """
+        ...
+
+    async def step(self, action: ActionType) -> TimeStep[ObservationType, RewardType, DiscountType]:
+        """Updates the environment according to the action and returns a `TimeStep`.
+
+        If the environment returned a `TimeStep` with `StepType.LAST` at the
+        previous step, this call to `step` will start a new sequence and `action`
+        will be ignored.
+
+        This method will also start a new sequence if called after the environment
+        has been constructed and `reset` has not been called. Again, in this case
+        `action` will be ignored.
+
+        Args:
+          action: A NumPy array, or a nested dict, list or tuple of arrays
+            corresponding to `action_spec()`.
+
+        Returns:
+          A `TimeStep` namedtuple containing:
+            step_type: A `StepType` value.
+            reward: Reward at this timestep, or None if step_type is
+              `StepType.FIRST`. Must conform to the specification returned by
+              `reward_spec()`.
+            discount: A discount in the range [0, 1], or None if step_type is
+              `StepType.FIRST`. Must conform to the specification returned by
+              `discount_spec()`.
+            observation: A NumPy array, or a nested dict, list or tuple of arrays.
+              Scalar values that can be cast to NumPy arrays (e.g. Python floats)
+              are also valid in place of a scalar array. Must conform to the
+              specification returned by `observation_spec()`.
+        """
+        ...
+
+    # TODO: adapt the dm_env specs for ARES.
+    # def reward_spec(self):
+    #     """Describes the reward returned by the environment.
+
+    #     By default this is assumed to be a single float.
+
+    #     Returns:
+    #       An `Array` spec, or a nested dict, list or tuple of `Array` specs.
+    #     """
+    #     return specs.Array(shape=(), dtype=float, name="reward")
+
+    # def discount_spec(self) -> specs.Array:
+    #     """Describes the discount returned by the environment.
+
+    #     By default this is assumed to be a single float between 0 and 1.
+
+    #     Returns:
+    #       An `Array` spec, or a nested dict, list or tuple of `Array` specs.
+    #     """
+    #     return specs.BoundedArray(shape=(), dtype=float, minimum=0.0, maximum=1.0, name="discount")
+
+    # def observation_spec(self):
+    #     """Defines the observations provided by the environment.
+
+    #     May use a subclass of `specs.Array` that specifies additional properties
+    #     such as min and max bounds on the values.
+
+    #     Returns:
+    #       An `Array` spec, or a nested dict, list or tuple of `Array` specs.
+    #     """
+
+    # def action_spec(self):
+    #     """Defines the actions that should be provided to `step`.
+
+    #     May use a subclass of `specs.Array` that specifies additional properties
+    #     such as min and max bounds on the values.
+
+    #     Returns:
+    #       An `Array` spec, or a nested dict, list or tuple of `Array` specs.
+    #     """
+
+    async def close(self) -> None:
+        """Frees any resources used by the environment.
+
+        Implement this method for an environment backed by an external process.
+
+        This method can be used directly
+
+        ```python
+        env = Env(...)
+        # Use env.
+        env.close()
+        ```
+
+        or via a context manager
+
+        ```python
+        with Env(...) as env:
+          # Use env.
+        ```
+        """
+        pass
+
+    async def __aenter__(self) -> Self:
+        """Allows the environment to be used in an async with-statement context."""
+        return self
+
+    async def __aexit__(
+        self, exc_type: type[BaseException] | None, exc_value: BaseException | None, traceback: TracebackType | None
+    ):
+        """Allows the environment to be used in an async with-statement context."""
+        del exc_type, exc_value, traceback  # Unused.
+        await self.close()
 
 
 async def create_container(
@@ -71,16 +228,16 @@ async def create_container(
 class Janitor:
     def __init__(self):
         # We use the in-memory ID since the environment isn't hashable.
-        self._environment_by_id: dict[int, BaseEnv] = {}
+        self._environment_by_id: dict[int, CodeBaseEnv] = {}
         atexit.register(self._sync_cleanup)
 
-    def register_for_cleanup(self, env: "BaseEnv"):
+    def register_for_cleanup(self, env: "CodeBaseEnv"):
         self._environment_by_id[id(env)] = env
 
-    def unregister_for_cleanup(self, env: "BaseEnv"):
+    def unregister_for_cleanup(self, env: "CodeBaseEnv"):
         del self._environment_by_id[id(env)]
 
-    def _cleanup_environment(self, env: "BaseEnv") -> None:
+    def _cleanup_environment(self, env: "CodeBaseEnv") -> None:
         if env._container is not None:
             _LOGGER.info("Stopping and removing container %s.", env._container)
             env._container.stop_and_remove()
@@ -100,11 +257,8 @@ class Janitor:
 _ENVIRONMENT_JANITOR = Janitor()
 
 
-class BaseEnv[TaskType]:
-    """Base Env that computes reward at the end of an episode.
-
-    TODO: Name this better (BaseEndRewardEnv?)
-    """
+class CodeBaseEnv[TaskType](Environment[llms.LLMResponse, llms.LLMRequest | None, float, float]):
+    """Base environment for code agents that computes reward at the end of an episode."""
 
     def __init__(
         self,
@@ -138,30 +292,7 @@ class BaseEnv[TaskType]:
         # Register for cleanup on exit.
         _ENVIRONMENT_JANITOR.register_for_cleanup(self)
 
-    async def __aenter__(self) -> "BaseEnv":
-        self._is_active = True
-        _ENVIRONMENT_JANITOR.register_for_cleanup(self)
-        return self
-
-    async def __aexit__(
-        self, exc_type: type[BaseException] | None, exc_value: BaseException | None, traceback: TracebackType | None
-    ) -> None:
-        del exc_type, exc_value, traceback  # Unused.
-
-        self._is_active = False
-
-        if self._container is not None:
-            _LOGGER.debug("[%d] Stopping container on exit.", id(self))
-            await self._container.stop()
-            self._container = None
-
-        _ENVIRONMENT_JANITOR.unregister_for_cleanup(self)
-
-    def _assert_active(self) -> None:
-        if not self._is_active:
-            raise RuntimeError("Environment is not active.")
-
-    async def reset(self) -> base.TimeStep[llms.LLMRequest]:
+    async def reset(self) -> base.TimeStep[llms.LLMRequest, float, float]:
         # Require the environment to be used as a context manager.
         reset_start_time = time.time()
         self._assert_active()
@@ -189,15 +320,15 @@ class BaseEnv[TaskType]:
         if ts.step_type == "LAST":
             raise RuntimeError("The code agent didn't make any LLM requests.")
 
-        # It would have been a MID timestep, but we can make it a FIRST instead.
+        # get_time_step always returns a MID timestep, but we know it's actually a first timestep.
         assert ts.observation is not None
-        result = cast(base.TimeStep[llms.LLMRequest], dataclasses.replace(ts, step_type="FIRST"))
+        result = TimeStep(step_type="FIRST", reward=ts.reward, discount=ts.discount, observation=ts.observation)
 
         reset_end_time = time.time()
         self._tracker.scalar(f"{self._prefix}/reset", reset_end_time - reset_start_time)
         return result
 
-    async def step(self, action: llms.LLMResponse) -> base.TimeStep[llms.LLMRequest | None]:
+    async def step(self, action: llms.LLMResponse) -> base.TimeStep[llms.LLMRequest | None, float, float]:
         # Require the environment to be used as a context manager.
         step_start_time = time.time()
         self._assert_active()
@@ -221,9 +352,10 @@ class BaseEnv[TaskType]:
 
         if self._step_count >= self._step_limit:
             _LOGGER.debug("[%d] Step limit reached. Returning LAST timestep.", id(self))
+            assert self._code_agent_task is not None
             self._code_agent_task.cancel()
-            # Truncation: step_type="LAST", discount=1.0.
-            ts = dataclasses.replace(ts, step_type="LAST")
+            # Truncation: step_type="LAST", discount=1.0, unless we're _also_ already in a terminal state.
+            ts = TimeStep(step_type="LAST", reward=ts.reward, discount=ts.discount, observation=ts.observation)
 
         if ts.step_type == "LAST":
             self._requires_reset = True
@@ -235,7 +367,7 @@ class BaseEnv[TaskType]:
 
     async def _get_time_step(
         self,
-    ) -> base.TimeStep[llms.LLMRequest | None]:
+    ) -> base.TimeStep[llms.LLMRequest | None, float, float]:
         # Wait for the code agent to send another request or complete.
         _LOGGER.debug("[%d] Waiting for code agent or LLM request.", id(self))
         with self._tracker.timeit(f"{self._prefix}/get_from_queue"):
@@ -269,6 +401,32 @@ class BaseEnv[TaskType]:
                 return base.TimeStep(step_type="MID", reward=0.0, discount=1.0, observation=req_and_future.value)
 
         raise RuntimeError("Code agent task or LLM request future did not complete.")
+
+    async def close(self) -> None:
+        # Shut down any resources used by the environment.
+        if self._container is not None:
+            _LOGGER.debug("[%d] Stopping container on exit.", id(self))
+            await self._container.stop()
+            self._container = None
+
+    async def __aenter__(self) -> "CodeBaseEnv":
+        self._is_active = True
+        _ENVIRONMENT_JANITOR.register_for_cleanup(self)
+        return self
+
+    async def __aexit__(
+        self, exc_type: type[BaseException] | None, exc_value: BaseException | None, traceback: TracebackType | None
+    ) -> None:
+        del exc_type, exc_value, traceback  # Unused.
+
+        self._is_active = False
+        await self.close()
+
+        _ENVIRONMENT_JANITOR.unregister_for_cleanup(self)
+
+    def _assert_active(self) -> None:
+        if not self._is_active:
+            raise RuntimeError("Environment is not active.")
 
     @abc.abstractmethod
     async def _reset_task(self) -> None:
