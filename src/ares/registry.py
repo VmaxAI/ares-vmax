@@ -15,7 +15,7 @@ from collections.abc import Sequence
 import dataclasses
 import logging
 import re
-from typing import Protocol
+from typing import Protocol, overload
 
 from ares.containers import containers
 from ares.containers import docker
@@ -457,16 +457,25 @@ def _list_presets() -> Sequence[str]:
     return tuple(sorted(_REGISTRY.keys()))
 
 
-def info(name: str | None = None) -> str:
+@overload
+def info(name: str) -> EnvironmentInfo: ...
+
+
+@overload
+def info(name: None) -> Sequence[EnvironmentInfo]: ...
+
+
+def info(name: str | None = None) -> EnvironmentInfo | Sequence[EnvironmentInfo]:
     """Get information about registered presets.
 
     Args:
         name: Optional preset name to get info for. If None, returns info for all presets.
 
     Returns:
-        A formatted string describing the preset(s). For a specific preset, includes
-        the name, description, and number of tasks. For all presets, includes a summary
-        table with key information.
+        If name is provided: An EnvironmentInfo object containing the preset's name,
+            description, and number of tasks.
+        If name is None: A sequence of EnvironmentInfo objects for all registered presets,
+            or an empty sequence if no presets are registered.
 
     Raises:
         KeyError: If a specific name is provided but not found in the registry.
@@ -474,13 +483,16 @@ def info(name: str | None = None) -> str:
     Examples:
         Get info for all presets:
 
-        >>> print(info())
-        Available presets:
-          - sbv-mswea (500 tasks): SWE-bench Verified with mini-swe-agent
+        >>> all_presets = info()
+        >>> print(all_presets[0])
+        sbv-mswea (500 tasks): SWE-bench Verified with mini-swe-agent
 
         Get info for a specific preset:
 
-        >>> print(info("sbv-mswea"))
+        >>> preset_info = info("sbv-mswea")
+        >>> print(preset_info.num_tasks)
+        500
+        >>> print(preset_info)
         sbv-mswea (500 tasks): SWE-bench Verified with mini-swe-agent
     """
     if name is not None:
@@ -488,19 +500,19 @@ def info(name: str | None = None) -> str:
             raise KeyError(f"Preset '{name}' not found. Available presets: {', '.join(_list_presets())}")
 
         spec = _REGISTRY[name]
-        return str(spec.get_info())
+        return spec.get_info()
 
     # List all presets with summary information
     presets = _list_presets()
     if not presets:
-        return "No presets registered."
+        return []
 
-    lines = ["Available presets:"]
+    spec_infos: list[EnvironmentInfo] = []
     for preset_id in presets:
         spec = _REGISTRY[preset_id]
-        lines.append(f"  - {spec.get_info()}")
+        spec_infos.append(spec.get_info())
 
-    return "\n".join(lines)
+    return spec_infos
 
 
 def make(
