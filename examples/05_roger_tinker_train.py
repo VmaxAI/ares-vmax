@@ -12,26 +12,58 @@ The integration works by wrapping ARES environments in Tinker-compatible adapter
 
 Prerequisites:
     Set your TINKER_API_KEY environment variable.
+    Set DAYTONA_API_KEY if using DaytonaContainer (default).
 
 Usage:
-    # Train with defaults (Qwen3-4B on sbv-mswea)
-    uv run -m examples.05_tinker_train
+    # Train with defaults (Qwen3-4B on sbv-mswea, auto-detected LR, PPO loss)
+    uv run -m examples.05_roger_tinker_train
 
-    # Train with custom model and hyperparameters
-    uv run -m examples.05_tinker_train \
+    # Train with custom model (LR auto-detected per model via get_lr())
+    uv run -m examples.05_roger_tinker_train \
         model_name=meta-llama/Llama-3.1-8B-Instruct \
-        learning_rate=5e-7 \
         lora_rank=64 \
         num_tasks=100
 
+    # Override auto-detected learning rate
+    uv run -m examples.05_roger_tinker_train \
+        learning_rate=5e-4
+
+    # Use importance sampling loss instead of PPO (not recommended for async)
+    uv run -m examples.05_roger_tinker_train \
+        loss_fn=importance_sampling
+
+    # Disable constant reward group filtering (not recommended for SWE-bench)
+    uv run -m examples.05_roger_tinker_train \
+        remove_constant_reward_groups=False
+
+    # Enable gradient clipping (0.0 = no clipping)
+    uv run -m examples.05_roger_tinker_train \
+        grad_clip_norm=1.0
+
     # Enable WandB logging
-    uv run -m examples.05_tinker_train \
+    uv run -m examples.05_roger_tinker_train \
         wandb_project=ares-rl \
         wandb_name=my-experiment
 
     # Continue from checkpoint
-    uv run -m examples.05_tinker_train \
+    uv run -m examples.05_roger_tinker_train \
         load_checkpoint_path=/path/to/checkpoint
+
+Key training parameters:
+    loss_fn: "ppo" (default, recommended), "importance_sampling", "cispo", "dro"
+    remove_constant_reward_groups: True (default) - filters zero-signal groups
+    learning_rate: None (default) = auto-detect via tinker_cookbook.hyperparam_utils.get_lr()
+    eval_every: 20 (default) - evaluate on test set every N steps
+    temperature: 1.0 (default) - sampling temperature for rollouts
+    grad_clip_norm: 0.0 (default) - max global gradient norm (0.0 = no clipping)
+
+Notes:
+    - AdamParams uses beta1=0.9, beta2=0.95, eps=1e-8 with configurable grad_clip_norm.
+      PPO's clipped ratio provides implicit gradient stabilization; explicit clipping is optional.
+    - With async training (max_steps_off_policy > 0), PPO is strongly recommended over
+      importance_sampling to prevent extreme importance ratios from off-policy data.
+    - For SWE-bench (~10% solve rate, group_size=4), ~66% of groups have constant rewards.
+      remove_constant_reward_groups=True filters these to avoid wasted gradient updates.
 
 Implementation heavily inspired by:
 - https://github.com/thinking-machines-lab/tinker-cookbook/blob/main/tinker_cookbook/recipes/code_rl/code_env.py
@@ -53,7 +85,9 @@ import chz
 import frozendict
 import numpy as np
 import tinker
+from tinker.types import LossFnType
 from tinker_cookbook import cli_utils
+from tinker_cookbook import hyperparam_utils
 from tinker_cookbook import model_info
 from tinker_cookbook import renderers
 from tinker_cookbook import tokenizer_utils
@@ -82,23 +116,30 @@ def _get_text_content(message: renderers.Message) -> str:
     return "".join(p["text"] for p in content if p["type"] == "text")  # type: ignore
 
 
-def _middle_truncate(model_input: tinker.ModelInput, max_context_len: int) -> tinker.ModelInput:
-    """Truncate model input from the middle when exceeding max context length.
+def _truncate_preserve_ends(model_input: tinker.ModelInput, max_context_len: int) -> tinker.ModelInput:
+    """Truncate model input by dropping middle tokens, preserving start and end.
 
-    This preserves both the beginning (task context) and end (recent history)
-    of the conversation while removing middle content.
+    Keeps the first portion (system prompt + task context) and the last portion
+    (recent conversation history) while dropping tokens in between. This is
+    better than symmetric middle-truncation because the system prompt at the
+    start and the most recent turns at the end carry the most information.
     """
     num_tokens_to_truncate = model_input.length - max_context_len + CONTEXT_LEN_BUFFER
     if num_tokens_to_truncate <= 0:
         return model_input
 
-    center_idx = model_input.length // 2
-    truncate_start_idx = center_idx - num_tokens_to_truncate // 2
-    truncate_end_idx = center_idx + num_tokens_to_truncate // 2
-
     curr_ints = model_input.to_ints()
-    # TODO: Put something in between (like an ellipsis)
-    new_ints = curr_ints[:truncate_start_idx] + curr_ints[truncate_end_idx:]
+    total_keep = len(curr_ints) - num_tokens_to_truncate
+
+    if total_keep <= 0:
+        return model_input
+
+    # Keep ~25% of preserved tokens at the start (system prompt + task context),
+    # and ~75% at the end (recent conversation). Minimum 256 tokens at start.
+    start_keep = min(max(256, total_keep // 4), total_keep)
+    end_keep = total_keep - start_keep
+
+    new_ints = curr_ints[:start_keep] + curr_ints[-end_keep:] if end_keep > 0 else curr_ints[:start_keep]
     return tinker.ModelInput.from_ints(new_ints)
 
 
@@ -143,9 +184,11 @@ class TinkerCompatibleEnv(tinker_types.Env):
         ]
         model_input = self.renderer.build_generation_prompt(messages)
 
-        # May need to truncate context len to prevent errors
-        if model_input.length > DEFAULT_MAX_CONTEXT_LEN - self.max_tokens + CONTEXT_LEN_BUFFER:
-            model_input = _middle_truncate(model_input, DEFAULT_MAX_CONTEXT_LEN - self.max_tokens)
+        # Truncate if prompt would exceed context window after reserving space for generation
+        max_prompt_tokens = DEFAULT_MAX_CONTEXT_LEN - self.max_tokens
+        if model_input.length > max_prompt_tokens - CONTEXT_LEN_BUFFER:
+            _LOGGER.warning("Truncating prompt from %d to %d tokens", model_input.length, max_prompt_tokens)
+            model_input = _truncate_preserve_ends(model_input, max_prompt_tokens)
 
         return model_input
 
@@ -176,8 +219,12 @@ class TinkerCompatibleEnv(tinker_types.Env):
 
         if ts.last():
             # Hack to approximate a context manager
-            await self.env.__aexit__(None, None, None)
+            try:
+                await self.env.__aexit__(None, None, None)
+            except Exception as e:
+                _LOGGER.warning("Failed to clean up environment (training continues): %s", e)
 
+        step_count = self.env._step_count  # type: ignore[attr-defined]
         return tinker_types.StepResult(
             reward=ts.reward or 0.0,
             episode_done=ts.last(),
@@ -185,7 +232,8 @@ class TinkerCompatibleEnv(tinker_types.Env):
             next_stop_condition=self.stop_condition,
             metrics={
                 "reward": ts.reward or 0.0,
-                "step_count": self.env._step_count,  # type: ignore
+                "step_count": step_count,
+                "episode_length": step_count,
             },
         )
 
@@ -205,6 +253,9 @@ class TinkerEnvGroupBuilder(tinker_types.EnvGroupBuilder):
     renderer: renderers.Renderer
     convo_prefix: list[renderers.Message] | None = None
     max_tokens: int
+
+    def logging_tags(self) -> list[str]:
+        return [self.env_preset_name, f"task_{self.env_preset_idx}"]
 
     async def make_envs(self) -> Sequence[TinkerCompatibleEnv]:
         envs: list[TinkerCompatibleEnv] = []
@@ -385,8 +436,8 @@ class CLIConfig:
     group_size: int = 4
     # Number of environment groups per training batch
     groups_per_batch: int = 20
-    # Learning rate for LoRA parameter updates
-    learning_rate: float = 1e-6
+    # Learning rate for LoRA parameter updates (None = auto-detect via get_lr())
+    learning_rate: float | None = None
     # Maximum tokens to generate per LLM response
     max_tokens: int = 2048
     # KL penalty coefficient for policy regularization (0.0 = no regularization)
@@ -395,6 +446,16 @@ class CLIConfig:
     num_substeps: int = 1
     # Random seed for reproducibility
     seed: int = 0
+    # Loss function: "ppo" (recommended), "importance_sampling", "cispo", "dro"
+    # PPO clips the importance ratio to prevent extreme updates with off-policy data.
+    loss_fn: LossFnType = "ppo"
+    #   groups where all rollouts have the same reward (zero gradient signal).
+    # Critical for SWE-bench where ~66% of groups have all-zero rewards at ~10% solve rate.
+    remove_constant_reward_groups: bool = True
+    # Temperature for LLM sampling during rollouts
+    temperature: float = 1.0
+    # Maximum global gradient norm for clipping (0.0 = no clipping)
+    grad_clip_norm: float = 0.5
 
     # === Async Rollout Configuration ===
     # Max steps an environment can lag behind current policy (None = synchronous, 10 = async)
@@ -405,7 +466,7 @@ class CLIConfig:
     # Directory for logs (deprecated, use log_path instead)
     log_dir: str | None = None
     # Full path for training logs and checkpoints (auto-generated if None)
-    log_path: str | None = None
+    log_path: str | None = "ares-tinker-logs"
     # WandB project name (enables WandB logging if set)
     wandb_project: str | None = None
     # WandB run name (auto-generated if None)
@@ -445,11 +506,18 @@ async def main(cli_config: CLIConfig):
     # Auto-detect renderer if not specified
     renderer_name = cli_config.renderer_name or model_info.get_recommended_renderer_name(cli_config.model_name)
 
+    # Auto-detect learning rate if not specified
+    if cli_config.learning_rate is None:
+        learning_rate = hyperparam_utils.get_lr(cli_config.model_name)
+        _LOGGER.info("Auto-detected learning rate: %s for model %s", learning_rate, cli_config.model_name)
+    else:
+        learning_rate = cli_config.learning_rate
+
     # Generate run name for logging and checkpointing
     model_tag = cli_config.model_name.replace("/", "-")
     run_name = (
         f"ares-tinker-{model_tag}-{cli_config.lora_rank}rank-"
-        f"{cli_config.learning_rate}lr-{cli_config.group_size}group-"
+        f"{learning_rate}lr-{cli_config.group_size}group-"
         f"{cli_config.groups_per_batch}batch-seed{cli_config.seed}-"
         f"{dt.datetime.now().strftime('%Y-%m-%d-%H-%M')}"
     )
@@ -461,8 +529,14 @@ async def main(cli_config: CLIConfig):
     wandb_name = cli_config.wandb_name or run_name
 
     _LOGGER.info("Starting training run: %s", run_name)
-    _LOGGER.info("Model: %s (rank=%d)", cli_config.model_name, cli_config.lora_rank)
-    _LOGGER.info("Environment: %s (%d tasks)", cli_config.env_preset_name, cli_config.num_tasks or 0)
+    _LOGGER.info("Model: %s (rank=%d, lr=%s)", cli_config.model_name, cli_config.lora_rank, learning_rate)
+    _LOGGER.info(
+        "Training: loss_fn=%s, remove_constant_reward_groups=%s, grad_clip_norm=%s",
+        cli_config.loss_fn,
+        cli_config.remove_constant_reward_groups,
+        cli_config.grad_clip_norm,
+    )
+    _LOGGER.info("Environment: %s (%s tasks)", cli_config.env_preset_name, cli_config.num_tasks or "all")
     _LOGGER.info("Log path: %s", log_path)
 
     # Build ARES dataset with Tinker compatibility layer
@@ -480,11 +554,14 @@ async def main(cli_config: CLIConfig):
 
     # Configure Tinker training
     config = tinker_train.Config(
-        learning_rate=cli_config.learning_rate,
+        learning_rate=learning_rate,
         dataset_builder=dataset_builder,
         model_name=cli_config.model_name,
         lora_rank=cli_config.lora_rank,
         max_tokens=cli_config.max_tokens,
+        temperature=cli_config.temperature,
+        loss_fn=cli_config.loss_fn,
+        remove_constant_reward_groups=cli_config.remove_constant_reward_groups,
         wandb_project=cli_config.wandb_project,
         wandb_name=wandb_name,
         log_path=log_path,
@@ -506,8 +583,45 @@ async def main(cli_config: CLIConfig):
     # Verify log directory behavior
     cli_utils.check_log_dir(log_path, behavior_if_exists=cli_config.behavior_if_log_dir_exists)
 
+    # Monkey-patch optim_step to include grad_clip_norm in AdamParams
+    _original_optim_step = tinker_train.optim_step
+
+    async def _optim_step_with_grad_clip(
+        training_client: tinker.TrainingClient,
+        learning_rate: float,
+    ) -> None:
+        adam_params = tinker.AdamParams(
+            learning_rate=learning_rate,
+            beta1=0.9,
+            beta2=0.95,
+            eps=1e-8,
+            grad_clip_norm=cli_config.grad_clip_norm,
+        )
+        optim_step_future = await training_client.optim_step_async(adam_params)
+        await optim_step_future.result_async()
+
+    tinker_train.optim_step = _optim_step_with_grad_clip  # type: ignore[assignment]
+
+    # Monkey-patch do_group_rollout_and_filter_constant_reward to skip on API errors
+    # instead of crashing the entire training run. The worker loop already handles None
+    # returns gracefully (train.py:509-510, 534-535).
+    _original_do_group_rollout_and_filter = tinker_train.do_group_rollout_and_filter_constant_reward
+
+    async def _safe_do_group_rollout_and_filter(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return await _original_do_group_rollout_and_filter(*args, **kwargs)
+        except tinker.BadRequestError as e:
+            _LOGGER.warning("Group rollout skipped due to API error (training continues): %s", e)
+            return None
+
+    tinker_train.do_group_rollout_and_filter_constant_reward = _safe_do_group_rollout_and_filter  # type: ignore[assignment]
+
     # Run training
-    await tinker_train.main(config)
+    try:
+        await tinker_train.main(config)
+    finally:
+        tinker_train.optim_step = _original_optim_step  # type: ignore[assignment]
+        tinker_train.do_group_rollout_and_filter_constant_reward = _original_do_group_rollout_and_filter  # type: ignore[assignment]
 
 
 if __name__ == "__main__":
