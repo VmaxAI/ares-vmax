@@ -4,280 +4,161 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-ARES (Agentic Research and Evaluation Suite) is an RL-first framework for training and evaluating code agents. It implements an async version of DeepMind's dm_env specification, treating LLM requests as observations and LLM responses as actions within a standard RL loop.
+ARES (Agentic Research and Evaluation Suite) is an RL-first framework for training and evaluating code agents. It implements an async version of DeepMind's dm_env specification, treating LLM requests as observations and LLM responses as actions within a standard RL loop. Published on PyPI as `martian-ares`.
 
 ## Development Commands
 
 ### Setup
 ```bash
-# Install all dependencies including dev tools
-uv sync --all-groups
-
-# Install only main dependencies
-uv sync
-
-# Install with specific groups
-uv sync --group dev
-uv sync --group examples
+uv sync --all-groups       # Install all dependencies including dev tools
+uv sync                    # Install only main dependencies
+uv sync --group dev        # Install dev tools (ruff, pyright, pytest)
+uv sync --group examples   # Install example dependencies
 ```
 
 ### Testing
 ```bash
-# Run all tests
-uv run pytest
-
-# Run a specific test file
-uv run pytest src/ares/config_test.py
-
-# Run tests matching a pattern
-uv run pytest -k "test_pattern_name"
+uv run pytest                              # Run all unit tests (src/ only)
+uv run pytest src/ares/config_test.py      # Run a specific test file
+uv run pytest -k "test_pattern_name"       # Run tests matching a pattern
+uv run pytest -n auto                      # Run tests in parallel (pytest-xdist)
 ```
 
-Unit tests follow the `*_test.py` naming pattern (preferred) or `test_*.py` and are colocated with source files in `src/`. Integration and end-to-end tests may live under `integration_tests/` at the root.
+Unit tests follow the `*_test.py` naming pattern (preferred) or `test_*.py` and are colocated with source files in `src/`. Integration tests live under `integration_tests/` and must be run manually (they require live API keys).
 
 ### Code Quality
 ```bash
-# Lint (check for issues)
-uv run ruff check
-
-# Format code
-uv run ruff format
-
-# Type checking
-uv run pyright
-
-# Fix auto-fixable linting issues
-uv run ruff check --fix
+uv run ruff check          # Lint
+uv run ruff check --fix    # Auto-fix lint issues
+uv run ruff format         # Format code
+uv run pyright             # Type checking (basic mode, Python 3.12)
 ```
 
-The project uses ruff for linting/formatting (line length: 120) and follows Google-style docstrings.
+Ruff config: line length 120, target `py313`, Google-style docstrings. See `ruff.toml` for full rule set.
 
 ### Running Examples
 ```bash
-# Run the minimal loop example with local Docker
-uv run -m examples.01_minimal_loop
-
-# Run with local LLM
-uv run -m examples.02_local_llm
+uv run -m examples.01_sequential_eval_with_local_llm   # Local Docker + local LLM
+uv run -m examples.02_sequential_eval_with_api          # Sequential eval with API
+uv run -m examples.03_parallel_eval_with_api            # Parallel eval with API
 ```
 
-Examples demonstrate basic usage patterns and require the examples dependency group.
+### ARES Proxy (Go)
+```bash
+cd ares-proxy && make build   # Build the Go proxy binary
+cd ares-proxy && make test    # Run Go tests
+cd ares-proxy && make run     # Run proxy (port 8080, 15 min timeout)
+```
+
+### Before Pushing
+```bash
+uv run pytest && uv run ruff format && uv run ruff check && uv run pyright
+```
 
 ## High-Level Architecture
 
 ### Core Abstraction: The RL Loop
 
-ARES treats code agent interactions as a reinforcement learning problem:
-
 1. **Environment** emits an **Observation** (LLM request with task context)
 2. **Agent** receives observation and returns an **Action** (LLM response with code/commands)
 3. **Environment** processes action, executes commands in container, returns next observation
-4. Loop continues until episode terminates (success, step limit, or explicit submission)
-5. **Reward** is computed at episode end (e.g., 1.0 if tests pass, 0.0 otherwise)
+4. Loop continues until episode terminates (success, step limit of 250, or explicit submission)
+5. **Reward** is computed at episode end (read from `/reward.txt` or `/reward.json` in container)
+
+### Registry and Presets System
+
+The primary API for creating environments:
+
+```python
+import ares
+env = ares.make("sbv-mswea")           # SWE-bench Verified with mini-swe-agent
+env = ares.make("sbv-mswea:0")         # Single task at index 0
+env = ares.make("sbv-mswea:0:10")      # Tasks 0-9 (slice)
+env = ares.make("sbv-mswea@2/8")       # Shard 2 of 8
+ares.info()                             # List all presets
+```
+
+Task selector syntax: `:N` (single index), `:start:end` (slice), `@shard/total` (sharding).
+
+Presets are auto-registered on import from Harbor datasets. Each dataset gets both `mswea` (mini-swe-agent) and `terminus2` variants. The default container factory is `DockerContainer` (not Daytona).
+
+Key files: `src/ares/registry.py` (registry mechanism), `src/ares/presets.py` (default preset registrations).
 
 ### Key Components
 
-#### 1. Environments (`src/ares/environments/`)
-
-**Base (`base.py`):**
+#### Environments (`src/ares/environments/`)
 - `Environment` protocol defines the dm_env interface (`reset()`, `step()`, `close()`)
+- `CodeEnvironment` (`code_env.py`) - Concrete implementation for Harbor-compatible datasets (including SWE-bench)
 - `TimeStep` namedtuple for observations, rewards, and episode signals
-- `create_container()` helper for creating containers from images or Dockerfiles
-- `Janitor` class for emergency cleanup of containers on abnormal termination
+- `create_container()` helper, `Janitor` class for emergency container cleanup
+- Harbor integration: `load_harbor_dataset()`, `list_harbor_datasets()`
 
-**Implementation (`code_env.py`):**
-- `CodeEnvironment` - Concrete environment for Harbor-compatible datasets (including SWE-bench)
-- Orchestrates the entire RL loop: manages container lifecycle, code agent execution, and LLM request interception
-- Builds containers from Dockerfiles with configurable resources (CPU, memory, disk)
-- Reads reward from `/reward.txt` or `/reward.json` in the container
-- Uses async context manager pattern (`async with env:`) for guaranteed cleanup
+#### Code Agents (`src/ares/code_agents/`)
+- `CodeAgent` protocol: `async def run(self, task: str) -> None`
+- `MiniSWECodeAgent` (`mini_swe_agent.py`) - Wraps mini-swe-agent library, parses bash commands from markdown
+- `Terminus2Agent` (`terminus2/terminus2_agent.py`) - Uses tmux for persistent terminal sessions, supports XML and JSON parsing
 
-**Episode Termination:**
-- Step limit reached (default: 250 steps for CodeEnvironment)
-- Agent explicitly submits (signals completion)
-- Container or agent error
+#### Containers (`src/ares/containers/`)
+- `Container` protocol with `start()`, `exec_run()`, `upload_files/download_files`, `stop_and_remove()`
+- `DockerContainer` (`docker.py`) - Local Docker containers (default)
+- `DaytonaContainer` (`daytona.py`) - Cloud containers via Daytona API
+- Both register cleanup with `atexit` for emergency shutdown
 
-#### 2. Code Agents (`src/ares/code_agents/`)
+#### LLM Clients (`src/ares/llms/`)
+- `LLMRequest`/`LLMResponse` dataclasses, `LLMClient` protocol
+- **Queue-Mediated LLM Client** (`queue_mediated_client.py`) - The most critical pattern. Intercepts LLM calls from agents using `asyncio.Queue`, exposing them as RL observations. This is what allows agents to be written naturally while the environment controls the RL loop.
+- `ChatCompletionCompatibleLLMClient` (`chat_completions_compatible.py`) - OpenAI-compatible API client (Martian API default)
+- Cost tracking via `accounting.py`
 
-**Interface:**
-```python
-class CodeAgent(Protocol):
-    async def run(self, task: str) -> None
-```
+#### ARES Proxy (`ares-proxy/`)
+Go-based HTTP proxy that intercepts OpenAI-compatible chat completion requests. Three endpoints:
+- `POST /v1/chat/completions` - Queues request, blocks until response
+- `GET /poll` - Retrieves pending requests for RL controller
+- `POST /respond` - Sends response back to waiting client
 
-**Main Implementation:**
-- `MiniSWECodeAgent` (`mini_swe_agent.py`) - Wraps the mini-swe-agent library
-  - Uses Jinja2-rendered system/instance templates
-  - Parses bash commands from markdown code blocks
-  - Handles format errors, timeouts, and submission signals
-  - Tracks performance statistics via `StatTracker`
+This is the network-level equivalent of `QueueMediatedLLMClient` - enables RL control of LLM interactions when agents run in separate processes/containers.
 
-**Factory Pattern:**
-- `CodeAgentFactory[T]` protocol creates agents with container and LLM client dependencies
-- Enables dependency injection and easy agent swapping
-
-#### 3. Containers (`src/ares/containers/`)
-
-**Abstract Protocol (`containers.py`):**
-```python
-class Container(Protocol):
-    async def start(env: dict[str, str] | None) -> None
-    async def exec_run(command, workdir, env, timeout_s) -> ExecResult
-    async def upload_files/download_files/upload_dir/download_dir
-    def stop_and_remove() -> None  # Sync for atexit cleanup
-```
-
-**Implementations:**
-- `DaytonaContainer` (`daytona.py`) - Cloud containers via Daytona API (default)
-  - Auto-stop and auto-delete configuration
-  - Retry logic with exponential backoff
-  - Supports resource specs (CPU, memory, disk, GPU)
-- `DockerContainer` (`docker.py`) - Local Docker containers via docker-py
-  - Builds images from Dockerfiles on-demand
-  - Uses `tail -f /dev/null` to keep containers alive
-  - Tar-based file upload/download
-
-**Janitor Pattern:**
-- Both implementations register cleanup with `atexit` for emergency shutdown
-- Ensures containers are removed even on abnormal termination
-
-#### 4. LLM Clients (`src/ares/llms/`)
-
-**Core Abstractions:**
-- `LLMRequest` - Dataclass with messages and optional temperature
-- `LLMResponse` - Dataclass with ChatCompletion and cost tracking
-- `LLMClient` Protocol - `async def __call__(request: LLMRequest) -> LLMResponse`
-
-**Key Pattern: Queue-Mediated LLM Client (`queue_mediated_client.py`):**
-
-This is the **most critical pattern** in ARES. It enables the RL abstraction by:
-1. Intercepting LLM calls from code agents using `asyncio.Queue`
-2. Exposing intercepted requests as observations to the RL environment
-3. Pairing requests with responses via futures
-4. Allowing agents to be written naturally (making direct LLM calls) while the environment controls the RL loop
-
-Without this pattern, agents would need explicit RL-aware interfaces, breaking the abstraction.
-
-**Other Implementations:**
-- `ChatCompletionCompatibleLLMClient` (`chat_completions_compatible.py`) - OpenAI-compatible API client
-  - Uses Martian API by default
-  - Retry logic with tenacity (3 attempts, exponential backoff)
-  - Integrated cost tracking via `accounting.py`
-
-#### 5. Supporting Modules
-
-**Configuration (`config.py`):**
-- Pydantic Settings-based configuration from `.env`
-- Required: `DAYTONA_API_KEY`, `DAYTONA_API_URL`, `CHAT_COMPLETION_API_KEY`
-- Auto-detects user from environment variables for logging/tracking
-
-**Statistics Tracking (`stat_tracker.py`):**
-- `StatTracker` Protocol with context manager for timing: `with tracker.timeit(name):`
-- Implementations: `NullStatTracker` (no-op), `LoggingStatTracker`, `TensorboardStatTracker`
-- Non-intrusive performance monitoring
-
-**Async Utilities (`async_utils.py`):**
-- `ValueAndFuture[ValType, FutureType]` - Pairs values with futures for coordination
-- Helper functions for async patterns
+#### Supporting Modules
+- `experiment_tracking/` - `StatTracker` protocol with `NullStatTracker`, `LoggingStatTracker`, `TensorboardStatTracker`
+- `config.py` - Pydantic Settings-based configuration from `.env`
+- `testing/` - `MockContainer` and `MockLLMClient` for unit tests
+- `contrib/` - Experimental: `llama_cpp.py` (local CPU inference), `eval_visualizer.py` (Textual TUI)
 
 ## Key Design Patterns
 
-### Protocol-Oriented Design
-Heavy use of `typing.Protocol` for structural subtyping without inheritance. Key protocols: `Environment`, `CodeAgent`, `Container`, `LLMClient`, `ContainerFactory`, `CodeAgentFactory`, `StatTracker`. Environments implement the `Environment` protocol directly without inheritance hierarchies.
-
-### Factory Pattern
-Used for dependency injection - environments receive factories, not concrete instances, allowing easy swapping of implementations (local vs cloud containers, different agents, etc.).
-
-### Context Manager Lifecycle
-All major resources use `async with` for guaranteed cleanup. Environments, containers, and other resources implement `__aenter__`/`__aexit__`.
-
-### Dataclass Immutability
-Most dataclasses use `frozen=True` to ensure thread-safety in async contexts.
-
-### Queue-Mediated Communication
-Async queues bridge linear agent code with the RL environment, enabling "interception" of LLM calls without agents being aware of the RL loop.
-
-### YAGNI (You Aren't Gonna Need It)
-Prefer concrete implementations over abstractions. For example, `CodeEnvironment` implements the `Environment` protocol directly without base classes, since Harbor is designed to handle all code agent benchmarks. Abstractions are added only when needed.
+- **Protocol-Oriented Design**: `typing.Protocol` for structural subtyping. Key protocols: `Environment`, `CodeAgent`, `Container`, `LLMClient`, `ContainerFactory`, `CodeAgentFactory`, `StatTracker`.
+- **Factory Pattern**: Environments receive factories (not concrete instances) for dependency injection.
+- **Context Manager Lifecycle**: All major resources use `async with` for guaranteed cleanup.
+- **Dataclass Immutability**: Most dataclasses use `frozen=True` for async safety.
+- **Queue-Mediated Communication**: Async queues bridge linear agent code with the RL environment.
+- **YAGNI**: Prefer concrete implementations over premature abstractions.
 
 ## Code Conventions
 
-### Naming
-- Private methods: `_method_name` (single underscore)
-- Module-level loggers: `_LOGGER`
-- Constants: `UPPER_CASE_WITH_UNDERSCORES`
-- Abstract methods marked with `@abc.abstractmethod`
-
-### Type Annotations
-Full type annotations throughout. Generic types used extensively (e.g., `CodeBaseEnv[TaskType]`).
-
-### Logging
-Extensive use of `logging.getLogger(__name__)` with object IDs for tracking across async operations. Example:
-```python
-_LOGGER.info("Container %s started", id(self))
-```
-
-### Error Handling
-- Custom exception hierarchies distinguish terminating vs non-terminating errors
-- Retry logic with exponential backoff for transient failures (container creation, API calls)
-
-### Imports
-Follow Google-style isort configuration:
-- Force single-line imports (except `typing` and `collections.abc`)
-- No separation between `import` and `from ... import`
-- Sort within sections
-
-**Import Conventions (Google Style):**
+### Imports (Google Style)
 - **Always import modules, not classes or functions**
-- **External consumers** (examples, docs):
-  - ✅ Good: `import ares` → use `ares.make(...)`
-  - ✅ Good: `from ares import llms` → use `llms.LLMRequest`, `llms.TextData`
-  - ❌ Avoid: `from ares.llms import LLMRequest, TextData`
-- **Internal code**:
-  - ✅ Good: `from ares.llms import request` → use `request.LLMRequest`
-  - ✅ Good: `from ares.llms import response` → use `response.TextData`, `response.Usage`
-  - ❌ Avoid: `from ares.llms.request import LLMRequest`
-  - ❌ Avoid: `from ares.llms.response import TextData, Usage`
-- Rationale: Makes code more readable and explicit about where objects come from
+- **External consumers**: `import ares` or `from ares import llms` -> `llms.LLMRequest`
+- **Internal code**: `from ares.llms import request` -> `request.LLMRequest`
+- **Avoid**: `from ares.llms.request import LLMRequest`
+- Force single-line imports (except `typing` and `collections.abc`)
+
+### Naming
+- Private methods: `_method_name`; loggers: `_LOGGER`; constants: `UPPER_CASE`
+- Full type annotations throughout; generic types used extensively
 
 ### Comments
-- WHY over WHAT - explain reasoning, edge cases, non-obvious decisions
-- HOW only when implementation is genuinely complex
+- WHY over WHAT; HOW only when genuinely complex
 
 ## Environment Variables
 
-Create `.env` file from `.env.example`:
-
-**Required for Daytona (default):**
-- `DAYTONA_API_KEY` - API key from daytona.io
-- `DAYTONA_API_URL` - Daytona API endpoint
-
-**Required for LLM inference:**
-- `CHAT_COMPLETION_API_KEY` - Martian API key from app.withmartian.com
-
-**Optional:**
-- `CHAT_COMPLETION_BASE_URL` - Override default API endpoint
-- `USER`, `LOGNAME`, `USERNAME` - User identification (auto-detected)
-
-## Testing Patterns
-
-- Unit tests must be under `src/` and live next to their source files
-  - Naming: `*_test.py` (preferred) or `test_*.py`
-  - Mock external services (containers, API calls) in unit tests
-- Integration and end-to-end tests may live under `integration_tests/` at the root
-- Use pytest fixtures for common setup
-- Async tests use `pytest-asyncio`
+Create `.env` from `.env.example`:
+- `DAYTONA_API_KEY`, `DAYTONA_API_URL` - Required for Daytona containers
+- `CHAT_COMPLETION_API_KEY` - Required for LLM inference (Martian API)
+- `CHAT_COMPLETION_BASE_URL` - Override default API endpoint (optional)
 
 ## CI/CD
 
-GitHub Actions workflow runs on PRs and main branch:
-- Linting with `ruff check`
-- Formatting check with `ruff format --check`
-
-Before pushing, ensure:
-```bash
-uv run pytest        # Tests pass
-uv run ruff format   # Code formatted
-uv run ruff check    # No lint errors
-uv run pyright       # Type checks pass
-```
+Three GitHub Actions workflows:
+- `ruff.yml` - Linting (`ruff check`) and formatting (`ruff format --check`)
+- `unit-tests.yml` - `pytest` on `src/`
+- `go-tests.yml` - Go tests for ares-proxy (triggers only on `ares-proxy/**` changes)

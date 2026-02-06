@@ -72,6 +72,9 @@ examples = [
     "tinker-cookbook>=0.1.0",
     "chz>=0.4.0",
     "numpy>=2.4.0",
+    "matplotlib>=3.10.0",
+    "pandas>=2.2.0",
+    "jupyter>=1.0.0",
 ]
 
 [tool.pytest.ini_options]
