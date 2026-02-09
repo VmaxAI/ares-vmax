@@ -100,9 +100,7 @@ CONTEXT_LEN_BUFFER = 10
 # I can't find how to programmatically access this anywhere, def varies by model
 DEFAULT_MAX_CONTEXT_LEN = 32768
 
-
 # === Utility Functions ===
-
 
 def _get_text_content(message: renderers.Message) -> str:
     """Extract text content from message, stripping thinking parts.
@@ -460,7 +458,7 @@ class CLIConfig:
     # === Async Rollout Configuration ===
     # Max steps an environment can lag behind current policy (None = synchronous, 10 = async)
     # NOTE: This is required to enable async rollouts.
-    max_steps_off_policy: int | None = 3
+    max_steps_off_policy: int | None = 5
 
     # === Logging, Evaluation, and Checkpointing ===
     # Directory for logs (deprecated, use log_path instead)

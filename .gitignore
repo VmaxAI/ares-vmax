@@ -132,3 +132,12 @@ ares-proxy/ares-proxy
 *.out
 vendor/
 go.work
+
+.ruff_cache/
+.pytest_cache/
+
+RUN_ALL.sh
+ppo_*
+reinforce_*
+cispo_*
+plots/*
