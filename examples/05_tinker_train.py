@@ -399,7 +399,7 @@ class CLIConfig:
     # === Async Rollout Configuration ===
     # Max steps an environment can lag behind current policy (None = synchronous, 10 = async)
     # NOTE: This is required to enable async rollouts.
-    max_steps_off_policy: int | None = 10
+    max_steps_off_policy: int | None = 3
 
     # === Logging, Evaluation, and Checkpointing ===
     # Directory for logs (deprecated, use log_path instead)
@@ -506,8 +506,25 @@ async def main(cli_config: CLIConfig):
     # Verify log directory behavior
     cli_utils.check_log_dir(log_path, behavior_if_exists=cli_config.behavior_if_log_dir_exists)
 
+    # Monkey-patch do_group_rollout_and_filter_constant_reward to skip on errors
+    # instead of crashing the entire training run. The worker loop already handles None
+    # returns gracefully (filters them out or skips in queue consumption).
+    _original_do_group_rollout_and_filter = tinker_train.do_group_rollout_and_filter_constant_reward
+
+    async def _safe_do_group_rollout_and_filter(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return await _original_do_group_rollout_and_filter(*args, **kwargs)
+        except Exception as e:
+            _LOGGER.warning("Group rollout skipped due to error (training continues): %s: %s", type(e).__name__, e)
+            return None
+
+    tinker_train.do_group_rollout_and_filter_constant_reward = _safe_do_group_rollout_and_filter  # type: ignore[assignment]
+
     # Run training
-    await tinker_train.main(config)
+    try:
+        await tinker_train.main(config)
+    finally:
+        tinker_train.do_group_rollout_and_filter_constant_reward = _original_do_group_rollout_and_filter  # type: ignore[assignment]
 
 
 if __name__ == "__main__":

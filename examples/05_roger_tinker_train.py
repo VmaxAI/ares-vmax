@@ -460,7 +460,7 @@ class CLIConfig:
     # === Async Rollout Configuration ===
     # Max steps an environment can lag behind current policy (None = synchronous, 10 = async)
     # NOTE: This is required to enable async rollouts.
-    max_steps_off_policy: int | None = 10
+    max_steps_off_policy: int | None = 3
 
     # === Logging, Evaluation, and Checkpointing ===
     # Directory for logs (deprecated, use log_path instead)
@@ -610,8 +610,8 @@ async def main(cli_config: CLIConfig):
     async def _safe_do_group_rollout_and_filter(*args: Any, **kwargs: Any) -> Any:
         try:
             return await _original_do_group_rollout_and_filter(*args, **kwargs)
-        except tinker.BadRequestError as e:
-            _LOGGER.warning("Group rollout skipped due to API error (training continues): %s", e)
+        except Exception as e:
+            _LOGGER.warning("Group rollout skipped due to error (training continues): %s: %s", type(e).__name__, e)
             return None
 
     tinker_train.do_group_rollout_and_filter_constant_reward = _safe_do_group_rollout_and_filter  # type: ignore[assignment]
