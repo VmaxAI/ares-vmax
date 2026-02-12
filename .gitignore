@@ -141,3 +141,6 @@ ppo_*
 reinforce_*
 cispo_*
 plots/*
+rl_runs/*
+runs/*
+WORKING_TINKER/*
