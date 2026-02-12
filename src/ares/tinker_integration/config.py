@@ -50,6 +50,11 @@ class TrainingConfig:
     # Sandbox safety
     auto_stop_minutes: int = 30
 
+    # Sandbox resources (None = use harbor/task defaults)
+    sandbox_cpus: int | None = None
+    sandbox_memory_gb: int | None = None
+    sandbox_disk_gb: int | None = None
+
     # Async rollout
     max_steps_off_policy: int | None = None
 

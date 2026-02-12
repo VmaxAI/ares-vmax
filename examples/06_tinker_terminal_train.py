@@ -72,9 +72,9 @@ def parse_args() -> config_mod.TrainingConfig:
     p.add_argument("--lora-rank", type=int, default=32, help="LoRA rank")
     p.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature")
     p.add_argument("--max-tokens", type=int, default=4096, help="Max generation tokens")
-    p.add_argument("--group-size", type=int, default=8, help="Rollouts per task")
-    p.add_argument("--groups-per-batch", type=int, default=1, help="Task groups per batch")
-    p.add_argument("--num-batches", type=int, default=25, help="Number of training batches")
+    p.add_argument("--group-size", type=int, default=5, help="Rollouts per task")
+    p.add_argument("--groups-per-batch", type=int, default=10, help="Task groups per batch")
+    p.add_argument("--num-batches", type=int, default=15, help="Number of training batches")
     p.add_argument("--max-trajectory-tokens", type=int, default=32768, help="Max context tokens")
 
     # Loss and training options
@@ -83,15 +83,18 @@ def parse_args() -> config_mod.TrainingConfig:
     p.add_argument("--grad-clip-norm", type=float, default=0.5, help="Gradient clipping norm")
     p.add_argument("--kl-penalty-coef", type=float, default=0.0, help="KL penalty coefficient")
 
-    # Sandbox safety
+    # Sandbox safety and resources
     p.add_argument("--auto-stop-minutes", type=int, default=30, help="Auto-stop idle sandboxes after N minutes")
+    p.add_argument("--sandbox-cpus", type=int, default=None, help="CPU cores per sandbox (default: task config)")
+    p.add_argument("--sandbox-memory-gb", type=int, default=None, help="RAM in GB per sandbox (default: task config)")
+    p.add_argument("--sandbox-disk-gb", type=int, default=None, help="Disk in GB per sandbox (default: task config)")
 
     # Async
     p.add_argument("--max-steps-off-policy", type=int, default=None, help="Max steps off-policy (None=sync)")
 
     # Logging
     p.add_argument("--log-path", type=str, required=True, help="Path for logs and checkpoints")
-    p.add_argument("--wandb-project", type=str, default=None, help="WandB project name")
+    p.add_argument("--wandb-project", type=str, default="ares-tinker", help="WandB project name")
     p.add_argument("--wandb-name", type=str, default=None, help="WandB run name")
     p.add_argument("--save-every", type=int, default=10, help="Save checkpoint every N batches")
     p.add_argument("--eval-every", type=int, default=0, help="Evaluate every N batches")
@@ -120,6 +123,9 @@ def parse_args() -> config_mod.TrainingConfig:
         grad_clip_norm=args.grad_clip_norm,
         kl_penalty_coef=args.kl_penalty_coef,
         auto_stop_minutes=args.auto_stop_minutes,
+        sandbox_cpus=args.sandbox_cpus,
+        sandbox_memory_gb=args.sandbox_memory_gb,
+        sandbox_disk_gb=args.sandbox_disk_gb,
         max_steps_off_policy=args.max_steps_off_policy,
         log_path=args.log_path,
         wandb_project=args.wandb_project,

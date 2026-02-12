@@ -72,13 +72,34 @@ async def run_training(config: config_mod.TrainingConfig) -> None:
         renderer_name=config.renderer_name,
         model_name_for_tokenizer=config.model_name,
         max_trajectory_tokens=config.max_trajectory_tokens,
-        gym_env_kwargs={"auto_stop_minutes": config.auto_stop_minutes},
+        gym_env_kwargs={
+            "auto_stop_minutes": config.auto_stop_minutes,
+            "sandbox_cpus": config.sandbox_cpus,
+            "sandbox_memory_gb": config.sandbox_memory_gb,
+            "sandbox_disk_gb": config.sandbox_disk_gb,
+        },
     )
 
     # Import tinker training module.
     tinker_mod = importlib.import_module("tinker")
     tinker_train = importlib.import_module("tinker_cookbook.rl.train")
     train_config_cls = tinker_train.Config
+
+    # Monkey-patch wandb config.update to allow value changes.
+    # tinker_cookbook logs the full Config (including the non-serializable
+    # dataset_builder) twice: once via wandb.init(config=...) and again in
+    # log_hparams -> wandb.config.update(). The second call sees a different
+    # object id for dataset_builder and raises ConfigError.  The env var
+    # WANDB_ALLOW_VAL_CHANGE is not checked by wandb's _sanitize(), so we
+    # patch the method directly.
+    import wandb.sdk.wandb_config as _wbcfg
+
+    _orig_config_update = _wbcfg.Config.update
+
+    def _config_update_allow(self: Any, d: Any, allow_val_change: Any = True) -> None:
+        return _orig_config_update(self, d, allow_val_change=allow_val_change)
+
+    _wbcfg.Config.update = _config_update_allow  # type: ignore[assignment]
 
     # Build training config (mirrors working reference's train.py lines 94-106).
     train_cfg_kwargs: dict[str, Any] = {
@@ -149,6 +170,26 @@ async def run_training(config: config_mod.TrainingConfig) -> None:
 
     tinker_train.do_group_rollout_and_filter_constant_reward = _safe_do_group_rollout_and_filter  # type: ignore[assignment]
 
+    # Monkey-patch do_train_step_and_get_sampling_client to skip batches where
+    # all rollouts failed.  When every group returns None (caught above), the
+    # filtered trajectory_groups_P list is empty and compute_trajectory_metrics
+    # crashes with ZeroDivisionError.  We detect this and skip the train step,
+    # returning a fresh sampling client from the unchanged model weights.
+    _original_do_train_step = tinker_train.do_train_step_and_get_sampling_client
+
+    async def _safe_do_train_step(*args: Any, **kwargs: Any) -> Any:
+        # The 7th positional arg (index 6) is trajectory_groups_P.
+        trajectory_groups = args[6] if len(args) > 6 else kwargs.get("trajectory_groups_P", [])
+        if not trajectory_groups:
+            _LOGGER.warning("All rollouts in batch failed — skipping train step (no weight update)")
+            # Return a sampling client from unchanged weights and empty metrics.
+            training_client_arg = args[2] if len(args) > 2 else kwargs["training_client"]
+            sampling_client = await training_client_arg.save_weights_and_get_sampling_client_async()
+            return sampling_client, {}
+        return await _original_do_train_step(*args, **kwargs)
+
+    tinker_train.do_train_step_and_get_sampling_client = _safe_do_train_step  # type: ignore[assignment]
+
     _LOGGER.info(
         "Starting training: model=%s, tasks=%d, batches=%d, group_size=%d",
         config.model_name,
@@ -171,3 +212,5 @@ async def run_training(config: config_mod.TrainingConfig) -> None:
     finally:
         tinker_train.optim_step = _original_optim_step  # type: ignore[assignment]
         tinker_train.do_group_rollout_and_filter_constant_reward = _original_do_group_rollout_and_filter  # type: ignore[assignment]
+        tinker_train.do_train_step_and_get_sampling_client = _original_do_train_step  # type: ignore[assignment]
+        _wbcfg.Config.update = _orig_config_update  # type: ignore[assignment]

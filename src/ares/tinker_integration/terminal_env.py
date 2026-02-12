@@ -129,14 +129,23 @@ class StepResult:
 _DEFAULT_AUTO_STOP_MINUTES = 30
 
 
-def _patch_daytona_sandbox_params(env: Any, sandbox_name: str, auto_stop_minutes: int) -> None:
-    """Monkey-patch a Harbor DaytonaEnvironment to inject readable names and auto-stop.
+def _patch_daytona_sandbox_params(
+    env: Any,
+    sandbox_name: str,
+    auto_stop_minutes: int,
+    *,
+    sandbox_cpus: int | None = None,
+    sandbox_memory_gb: int | None = None,
+    sandbox_disk_gb: int | None = None,
+) -> None:
+    """Monkey-patch a Harbor DaytonaEnvironment to inject readable names, auto-stop, and resources.
 
     Harbor's DaytonaEnvironment hard-codes ``auto_stop_interval=0`` (never auto-stop)
     and doesn't set a sandbox name. This patches ``_create_sandbox`` to override those
     defaults so that:
     - Sandboxes get a human-readable name (task + short UUID).
     - Sandboxes auto-stop after ``auto_stop_minutes`` of inactivity (safety net).
+    - Sandbox resources (CPU, memory, disk) can be overridden.
     """
     if not hasattr(env, "_create_sandbox"):
         return  # Not a DaytonaEnvironment — nothing to patch (e.g., Docker).
@@ -150,6 +159,15 @@ def _patch_daytona_sandbox_params(env: Any, sandbox_name: str, auto_stop_minutes
         # Set auto-stop so idle sandboxes don't burn money.
         if hasattr(params, "auto_stop_interval"):
             params.auto_stop_interval = auto_stop_minutes
+        # Override resources if specified.
+        has_overrides = sandbox_cpus is not None or sandbox_memory_gb is not None or sandbox_disk_gb is not None
+        if has_overrides and hasattr(params, "resources") and params.resources is not None:
+            if sandbox_cpus is not None:
+                params.resources.cpu = sandbox_cpus
+            if sandbox_memory_gb is not None:
+                params.resources.memory = sandbox_memory_gb
+            if sandbox_disk_gb is not None:
+                params.resources.disk = sandbox_disk_gb
         return await original_create(params)
 
     env._create_sandbox = _patched_create_sandbox
@@ -183,6 +201,9 @@ class AsyncTerminalGymEnv:
         reward_key: str | None = None,
         reward_reduce: Literal["sum", "single"] = "sum",
         auto_stop_minutes: int = _DEFAULT_AUTO_STOP_MINUTES,
+        sandbox_cpus: int | None = None,
+        sandbox_memory_gb: int | None = None,
+        sandbox_disk_gb: int | None = None,
         logger: logging.Logger | None = None,
     ):
         self._logger = (logger or logging.getLogger(__name__)).getChild(__name__)
@@ -216,9 +237,16 @@ class AsyncTerminalGymEnv:
             logger=self._logger,
         )
 
-        # Patch Daytona sandbox creation to inject readable names and auto-stop.
+        # Patch Daytona sandbox creation to inject readable names, auto-stop, and resources.
         sandbox_name = f"ares-tinker.{self._task.name}.{uuid4().hex[:8]}"
-        _patch_daytona_sandbox_params(self._environment, sandbox_name, auto_stop_minutes)
+        _patch_daytona_sandbox_params(
+            self._environment,
+            sandbox_name,
+            auto_stop_minutes,
+            sandbox_cpus=sandbox_cpus,
+            sandbox_memory_gb=sandbox_memory_gb,
+            sandbox_disk_gb=sandbox_disk_gb,
+        )
 
         self._tmux: Any | None = None
         self._verifier: Any | None = None
