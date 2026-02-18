@@ -326,6 +326,8 @@ class AsyncTerminalGymEnv:
         tmux_session_cls = harbor["TmuxSession"]
         verifier_cls = harbor["Verifier"]
 
+        _LOGGER.info("SANDBOX CREATING | task=%s | trial=%s", self._task.name, self._trial_name)
+
         try:
             # Rate-limit sandbox creation: the semaphore gates only environment.start(),
             # not the full lifecycle.  Many sandboxes can be active at once, but only N
@@ -376,11 +378,19 @@ class AsyncTerminalGymEnv:
             )
 
             self._started = True
+            _LOGGER.info("SANDBOX READY   | task=%s | trial=%s", self._task.name, self._trial_name)
 
             terminal_obs = await tmux.get_incremental_output()
             initial_prompt = self.build_initial_prompt(terminal_state=terminal_obs)
-        except BaseException:
+        except BaseException as exc:
             # Clean up partially-initialized state so we don't leak the sandbox.
+            _LOGGER.warning(
+                "SANDBOX FAILED  | task=%s | trial=%s | %s: %s",
+                self._task.name,
+                self._trial_name,
+                type(exc).__name__,
+                exc,
+            )
             if self._tmux is not None:
                 with contextlib.suppress(Exception):
                     await self._tmux.stop()
@@ -501,6 +511,8 @@ class AsyncTerminalGymEnv:
         if not self._started:
             return
 
+        _LOGGER.info("SANDBOX CLOSING | task=%s | trial=%s", self._task.name, self._trial_name)
+
         if self._tmux is not None:
             try:
                 await self._tmux.stop()
@@ -509,6 +521,15 @@ class AsyncTerminalGymEnv:
 
         try:
             await self._environment.stop(delete=self._delete_env)
+            _LOGGER.info("SANDBOX CLOSED  | task=%s | trial=%s", self._task.name, self._trial_name)
+        except Exception as e:
+            _LOGGER.warning(
+                "SANDBOX CLOSE ERR | task=%s | trial=%s | %s: %s",
+                self._task.name,
+                self._trial_name,
+                type(e).__name__,
+                e,
+            )
         finally:
             self._tmux = None
             self._verifier = None

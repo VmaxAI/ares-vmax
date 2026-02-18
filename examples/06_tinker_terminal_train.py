@@ -108,7 +108,7 @@ def parse_args() -> config_mod.TrainingConfig:
     p.add_argument("--kl-penalty-coef", type=float, default=0.0, help="KL penalty coefficient")
 
     # Sandbox safety and resources
-    p.add_argument("--auto-stop-minutes", type=int, default=270, help="Auto-stop idle sandboxes after N minutes")
+    p.add_argument("--auto-stop-minutes", type=int, default=30, help="Auto-stop idle sandboxes after N minutes")
     p.add_argument("--sandbox-cpus", type=int, default=None, help="CPU cores per sandbox (default: task config)")
     p.add_argument("--sandbox-memory-gb", type=int, default=None, help="RAM in GB per sandbox (default: task config)")
     p.add_argument("--sandbox-disk-gb", type=int, default=None, help="Disk in GB per sandbox (default: task config)")

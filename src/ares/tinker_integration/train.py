@@ -276,23 +276,61 @@ async def run_training(config: config_mod.TrainingConfig) -> None:
 
     tinker_train.do_group_rollout_and_filter_constant_reward = _safe_do_group_rollout_and_filter  # type: ignore[assignment]
 
-    # Monkey-patch do_train_step_and_get_sampling_client to skip batches where
-    # all rollouts failed.  When every group returns None (caught above), the
-    # filtered trajectory_groups_P list is empty and compute_trajectory_metrics
-    # crashes with ZeroDivisionError.  We detect this and skip the train step,
-    # returning a fresh sampling client from the unchanged model weights.
+    # Monkey-patch remove_constant_reward_groups to handle None values.
+    # _safe_do_group_rollout_and_filter returns None on permanent failure; the
+    # sync path collects these into trajectory_groups_P via gather_with_progress
+    # and passes them to remove_constant_reward_groups, which crashes calling
+    # group.get_total_rewards() on None.  Filter them out first.
+    _original_remove_constant_reward_groups = tinker_train.remove_constant_reward_groups
+
+    def _safe_remove_constant_reward_groups(trajectory_groups: list[Any]) -> list[Any]:
+        filtered = [g for g in trajectory_groups if g is not None]
+        if not filtered:
+            _LOGGER.warning("All rollouts in batch returned None — nothing to filter")
+            return filtered
+        return _original_remove_constant_reward_groups(filtered)
+
+    tinker_train.remove_constant_reward_groups = _safe_remove_constant_reward_groups  # type: ignore[assignment]
+
+    # Monkey-patch do_train_step_and_get_sampling_client to handle None values
+    # and skip batches where all rollouts failed.  When every group returns
+    # None (caught above), compute_trajectory_metrics crashes with
+    # ZeroDivisionError.  We filter Nones and skip the train step if empty.
     _original_do_train_step = tinker_train.do_train_step_and_get_sampling_client
 
     async def _safe_do_train_step(*args: Any, **kwargs: Any) -> Any:
-        # The 7th positional arg (index 6) is trajectory_groups_P.
-        trajectory_groups = args[6] if len(args) > 6 else kwargs.get("trajectory_groups_P", [])
+        # Positional indices match do_train_step_and_get_sampling_client(cfg,
+        # i_batch, training_client, kl_reference_client, tokenizer,
+        # env_group_builders_P[5], trajectory_groups_P[6]).
+        args_list = list(args)
+        trajectory_groups = args_list[6] if len(args_list) > 6 else kwargs.get("trajectory_groups_P", [])
+
+        # Filter out None trajectory groups (from crashed rollouts) and keep
+        # env_group_builders_P in sync so the two lists stay aligned.
+        if any(g is None for g in trajectory_groups):
+            original_count = len(trajectory_groups)
+            env_builders = args_list[5] if len(args_list) > 5 else kwargs.get("env_group_builders_P", [])
+            pairs = [(b, g) for b, g in zip(env_builders, trajectory_groups, strict=False) if g is not None]
+            filtered_builders = [p[0] for p in pairs]
+            filtered_groups = [p[1] for p in pairs]
+            if len(args_list) > 6:
+                args_list[5], args_list[6] = filtered_builders, filtered_groups
+            trajectory_groups = filtered_groups
+            _LOGGER.warning(
+                "TRAIN STEP | filtered %d None groups (%d -> %d valid)",
+                original_count - len(filtered_groups),
+                original_count,
+                len(filtered_groups),
+            )
+
         if not trajectory_groups:
-            _LOGGER.warning("All rollouts in batch failed — skipping train step (no weight update)")
-            # Return a sampling client from unchanged weights and empty metrics.
-            training_client_arg = args[2] if len(args) > 2 else kwargs["training_client"]
+            _LOGGER.warning("TRAIN STEP | all rollouts failed — skipping (no weight update)")
+            training_client_arg = args_list[2] if len(args_list) > 2 else kwargs["training_client"]
             sampling_client = await training_client_arg.save_weights_and_get_sampling_client_async()
             return sampling_client, {}
-        return await _original_do_train_step(*args, **kwargs)
+
+        _LOGGER.info("TRAIN STEP | training on %d groups", len(trajectory_groups))
+        return await _original_do_train_step(*args_list, **kwargs)
 
     tinker_train.do_train_step_and_get_sampling_client = _safe_do_train_step  # type: ignore[assignment]
 
@@ -397,6 +435,7 @@ async def run_training(config: config_mod.TrainingConfig) -> None:
     finally:
         tinker_train.optim_step = _original_optim_step  # type: ignore[assignment]
         tinker_train.do_group_rollout_and_filter_constant_reward = _original_do_group_rollout_and_filter  # type: ignore[assignment]
+        tinker_train.remove_constant_reward_groups = _original_remove_constant_reward_groups  # type: ignore[assignment]
         tinker_train.do_train_step_and_get_sampling_client = _original_do_train_step  # type: ignore[assignment]
         tinker_train.do_group_rollout = _original_do_group_rollout  # type: ignore[assignment]
         _wbcfg.Config.update = _orig_config_update  # type: ignore[assignment]

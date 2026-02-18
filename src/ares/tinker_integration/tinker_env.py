@@ -11,9 +11,12 @@ import contextlib
 from dataclasses import dataclass
 import importlib
 import json
+import logging
 from typing import Any, Protocol, TypedDict
 
 from ares.tinker_integration import terminal_env
+
+_LOGGER = logging.getLogger(__name__)
 
 _CONTEXT_LEN_BUFFER = 10
 
@@ -162,6 +165,10 @@ class HarborTerminalTinkerEnv:
         self._max_trajectory_tokens = int(max_trajectory_tokens)
         self._reserved_generation_tokens = max(0, int(reserved_generation_tokens))
         self._past_messages: list[dict[str, Any]] = []
+        self._step_count = 0
+        self._task_name = getattr(gym_env, "_task", None)
+        self._task_name = getattr(self._task_name, "name", "unknown") if self._task_name else "unknown"
+        self._trial_name = getattr(gym_env, "_trial_name", "unknown")
 
     def _fits_context_window(self, prompt_tokens: int) -> bool:
         """Return True if prompt + reserved generation tokens fits context window."""
@@ -172,7 +179,9 @@ class HarborTerminalTinkerEnv:
         return self._renderer.get_stop_sequences()
 
     async def initial_observation(self) -> tuple[Any, StopCondition]:
+        _LOGGER.info("ENV START | task=%s | trial=%s", self._task_name, self._trial_name)
         obs, info = await self._gym_env.reset()
+        self._step_count = 0
         initial_prompt = str(info.get("initial_prompt") or obs)
         self._past_messages = [{"role": "user", "content": initial_prompt}]
 
@@ -183,6 +192,12 @@ class HarborTerminalTinkerEnv:
                 f"{model_input.length} prompt + {self._reserved_generation_tokens} reserved "
                 f"> {self._max_trajectory_tokens}"
             )
+        _LOGGER.info(
+            "ENV READY | task=%s | trial=%s | prompt_tokens=%d",
+            self._task_name,
+            self._trial_name,
+            model_input.length,
+        )
         return model_input, self.stop_condition
 
     async def close(self) -> None:
@@ -192,6 +207,7 @@ class HarborTerminalTinkerEnv:
     async def step(self, action: list[int]) -> Any:
         tinker = importlib.import_module("tinker")
         step_result_cls = importlib.import_module("tinker_cookbook.rl.types").StepResult
+        self._step_count += 1
 
         # 1) Decode assistant message using renderer.
         message, parse_success = self._renderer.parse_response(action)
@@ -205,7 +221,12 @@ class HarborTerminalTinkerEnv:
             json_ok = 1.0
         except TerminalActionParseError:
             # Treat invalid JSON as a terminal failure.
-            # Close the sandbox to avoid resource leaks.
+            _LOGGER.info(
+                "ENV DONE  | task=%s | trial=%s | step=%d | reason=json_parse_error | reward=0.0",
+                self._task_name,
+                self._trial_name,
+                self._step_count,
+            )
             await self._gym_env.close()
             return step_result_cls(
                 reward=0.0,
@@ -215,6 +236,7 @@ class HarborTerminalTinkerEnv:
                 metrics={
                     "parse_success": float(bool(parse_success)),
                     "json_ok": 0.0,
+                    "too_long": 0.0,
                 },
             )
 
@@ -253,10 +275,16 @@ class HarborTerminalTinkerEnv:
             reward = float(reduced) if isinstance(reduced, (int, float)) else 0.0
 
         # 5) Build next observation for continuing episodes.
-        context_truncated = 0.0
+        too_long = 0.0
         if episode_done:
             next_observation = tinker.ModelInput.empty()
-            # Close the sandbox to avoid resource leaks.
+            _LOGGER.info(
+                "ENV DONE  | task=%s | trial=%s | step=%d | reason=task_complete | reward=%.3f",
+                self._task_name,
+                self._trial_name,
+                self._step_count,
+                reward,
+            )
             await self._gym_env.close()
         else:
             # New user prompt contains fresh terminal state.
@@ -266,12 +294,32 @@ class HarborTerminalTinkerEnv:
             self._past_messages.append({"role": "user", "content": next_prompt})
             next_observation = self._renderer.build_generation_prompt(self._past_messages)
             if not self._fits_context_window(next_observation.length):
-                # Context exceeds budget — middle-truncate (drop stale middle
-                # history, keep instruction at start + recent state at end)
-                # instead of killing the episode.  The agent keeps working.
-                max_prompt_tokens = self._max_trajectory_tokens - self._reserved_generation_tokens
-                next_observation = _middle_truncate(next_observation, max_prompt_tokens)
-                context_truncated = 1.0
+                # Context exceeds budget — terminate episode with reward=0.
+                # This bounds rollout length and prevents infinite loops when
+                # the model never emits task_complete.
+                _LOGGER.info(
+                    "ENV DONE  | task=%s | trial=%s | step=%d | reason=too_long | context=%d/%d",
+                    self._task_name,
+                    self._trial_name,
+                    self._step_count,
+                    next_observation.length,
+                    self._max_trajectory_tokens,
+                )
+                too_long = 1.0
+                episode_done = True
+                reward = 0.0
+                next_observation = tinker.ModelInput.empty()
+                await self._gym_env.close()
+            else:
+                _LOGGER.debug(
+                    "ENV STEP  | task=%s | trial=%s | step=%d | cmds=%d | tokens=%d/%d",
+                    self._task_name,
+                    self._trial_name,
+                    self._step_count,
+                    num_commands,
+                    next_observation.length,
+                    self._max_trajectory_tokens,
+                )
 
         return step_result_cls(
             reward=reward,
@@ -282,6 +330,6 @@ class HarborTerminalTinkerEnv:
                 "parse_success": float(bool(parse_success)),
                 "json_ok": json_ok,
                 "num_commands": num_commands,
-                "context_truncated": context_truncated,
+                "too_long": too_long,
             },
         )
