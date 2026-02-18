@@ -10,12 +10,40 @@ proven working reference.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from dataclasses import dataclass
 import importlib
 import logging
 from pathlib import Path
+import random
 from typing import Any, Literal
 from uuid import uuid4
+
+_sandbox_creation_semaphore: asyncio.Semaphore | None = None
+
+_LOGGER = logging.getLogger(__name__)
+
+_DEFAULT_MAX_CONCURRENT_SANDBOX_CREATIONS = 20
+
+
+def set_max_concurrent_sandboxes(n: int | None = _DEFAULT_MAX_CONCURRENT_SANDBOX_CREATIONS) -> None:
+    """Set the maximum number of concurrent sandbox *creation* requests.
+
+    Must be called before any ``AsyncTerminalGymEnv.reset()`` calls.  The
+    semaphore gates ``environment.start()`` only (not the full lifecycle), so
+    many sandboxes can be active simultaneously — only N can be starting at
+    once, preventing Daytona "too many requests" throttling.
+
+    Pass ``None`` to disable the limit entirely.
+    """
+    global _sandbox_creation_semaphore
+    if n is None:
+        _sandbox_creation_semaphore = None
+        _LOGGER.info("Sandbox creation rate limit disabled")
+    else:
+        _sandbox_creation_semaphore = asyncio.Semaphore(n)
+        _LOGGER.info("Sandbox creation concurrency limited to %d", n)
 
 
 def _import_harbor() -> dict[str, Any]:
@@ -126,7 +154,27 @@ class StepResult:
     info: dict[str, Any]
 
 
-_DEFAULT_AUTO_STOP_MINUTES = 30
+_DEFAULT_AUTO_STOP_MINUTES = 270
+
+# Retry config for transient Daytona errors (429, connection issues).
+_SANDBOX_START_MAX_RETRIES = 5
+_SANDBOX_START_BASE_DELAY = 60.0  # seconds
+_SANDBOX_START_MAX_DELAY = 300.0  # seconds
+
+# Retry config for verification file-transfer errors (upload tests, download results).
+# These are common under load (thundering herd when many sandboxes verify simultaneously).
+_VERIFY_MAX_RETRIES = 3
+_VERIFY_BASE_DELAY = 5.0  # seconds
+
+
+def _is_transient_error(exc: BaseException) -> bool:
+    """Return True if the exception looks like a transient/rate-limit error worth retrying."""
+    msg = str(exc).lower()
+    # Daytona SDK raises generic exceptions with "429" or "too many requests" in the message.
+    if "429" in msg or "too many requests" in msg or "rate limit" in msg:
+        return True
+    # Connection-level transient errors.
+    return any(kw in msg for kw in ("connection", "timeout", "temporary", "unavailable", "503", "502"))
 
 
 def _patch_daytona_sandbox_params(
@@ -278,34 +326,70 @@ class AsyncTerminalGymEnv:
         tmux_session_cls = harbor["TmuxSession"]
         verifier_cls = harbor["Verifier"]
 
-        await self._environment.start(force_build=self._force_build)
+        try:
+            # Rate-limit sandbox creation: the semaphore gates only environment.start(),
+            # not the full lifecycle.  Many sandboxes can be active at once, but only N
+            # can be in the process of starting, preventing Daytona 429 bursts.
+            # Retry with exponential backoff for transient errors (429, connection).
+            for attempt in range(1, _SANDBOX_START_MAX_RETRIES + 1):
+                try:
+                    if _sandbox_creation_semaphore is not None:
+                        async with _sandbox_creation_semaphore:
+                            await self._environment.start(force_build=self._force_build)
+                    else:
+                        await self._environment.start(force_build=self._force_build)
+                    break
+                except Exception as exc:
+                    if not _is_transient_error(exc) or attempt == _SANDBOX_START_MAX_RETRIES:
+                        raise
+                    delay = min(_SANDBOX_START_BASE_DELAY * (2 ** (attempt - 1)), _SANDBOX_START_MAX_DELAY)
+                    delay *= 0.5 + random.random()  # jitter
+                    self._logger.warning(
+                        "Sandbox start failed (attempt %d/%d), retrying in %.1fs: %s",
+                        attempt,
+                        _SANDBOX_START_MAX_RETRIES,
+                        delay,
+                        exc,
+                    )
+                    await asyncio.sleep(delay)
 
-        # Tmux log lives inside the sandbox/container. We don't rely on it.
-        remote_log_path = Path("/tmp/harbor_tmux_pane.log")
+            # Tmux log lives inside the sandbox/container. We don't rely on it.
+            remote_log_path = Path("/tmp/harbor_tmux_pane.log")
 
-        tmux = tmux_session_cls(
-            session_name=self._trial_name,
-            environment=self._environment,
-            logging_path=remote_log_path,
-            local_asciinema_recording_path=None,
-            remote_asciinema_recording_path=None,
-            pane_width=self._tmux_pane_width,
-            pane_height=self._tmux_pane_height,
-        )
-        self._tmux = tmux
-        await tmux.start()
+            tmux = tmux_session_cls(
+                session_name=self._trial_name,
+                environment=self._environment,
+                logging_path=remote_log_path,
+                local_asciinema_recording_path=None,
+                remote_asciinema_recording_path=None,
+                pane_width=self._tmux_pane_width,
+                pane_height=self._tmux_pane_height,
+            )
+            self._tmux = tmux
+            await tmux.start()
 
-        self._verifier = verifier_cls(
-            task=self._task,
-            trial_paths=self._trial_paths,
-            environment=self._environment,
-            logger=self._logger,
-        )
+            self._verifier = verifier_cls(
+                task=self._task,
+                trial_paths=self._trial_paths,
+                environment=self._environment,
+                logger=self._logger,
+            )
 
-        self._started = True
+            self._started = True
 
-        terminal_obs = await tmux.get_incremental_output()
-        initial_prompt = self.build_initial_prompt(terminal_state=terminal_obs)
+            terminal_obs = await tmux.get_incremental_output()
+            initial_prompt = self.build_initial_prompt(terminal_state=terminal_obs)
+        except BaseException:
+            # Clean up partially-initialized state so we don't leak the sandbox.
+            if self._tmux is not None:
+                with contextlib.suppress(Exception):
+                    await self._tmux.stop()
+            with contextlib.suppress(Exception):
+                await self._environment.stop(delete=self._delete_env)
+            self._tmux = None
+            self._verifier = None
+            self._started = False
+            raise
         info = {
             "trial_name": self._trial_name,
             "task_name": self._task.name,
@@ -316,6 +400,43 @@ class AsyncTerminalGymEnv:
         }
 
         return initial_prompt, info
+
+    async def _safe_verify(self) -> dict[str, float | int] | None:
+        """Run the verifier with retry logic for transient file-transfer errors.
+
+        Harbor's Verifier.verify() uploads tests and downloads results via
+        Daytona's file API.  Under load (many sandboxes verifying simultaneously)
+        these transfers can fail with AddTestsDirError or DownloadVerifierDirError.
+        Retrying a few times usually succeeds; if not, we return None (reward=0)
+        instead of crashing the entire group rollout.
+        """
+        if self._verifier is None:
+            return None
+
+        for attempt in range(1, _VERIFY_MAX_RETRIES + 1):
+            try:
+                verifier_result = await self._verifier.verify()
+                return verifier_result.rewards
+            except Exception as e:
+                if attempt < _VERIFY_MAX_RETRIES:
+                    delay = _VERIFY_BASE_DELAY * attempt * (0.5 + random.random())
+                    self._logger.warning(
+                        "Verification failed (attempt %d/%d), retrying in %.1fs: %s: %s",
+                        attempt,
+                        _VERIFY_MAX_RETRIES,
+                        delay,
+                        type(e).__name__,
+                        e,
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    self._logger.warning(
+                        "Verification failed after %d attempts, returning reward=0: %s: %s",
+                        _VERIFY_MAX_RETRIES,
+                        type(e).__name__,
+                        e,
+                    )
+        return None
 
     async def step(self, action: TerminalAction) -> StepResult:
         if not self._started or self._tmux is None:
@@ -335,11 +456,7 @@ class AsyncTerminalGymEnv:
         info: dict[str, Any] = {}
 
         if done:
-            rewards = None
-            if self._verifier is not None:
-                verifier_result = await self._verifier.verify()
-                rewards = verifier_result.rewards
-
+            rewards = await self._safe_verify()
             info["rewards"] = rewards
             reward = self._reduce_reward(rewards)
 
@@ -350,10 +467,7 @@ class AsyncTerminalGymEnv:
         if not self._started:
             raise RuntimeError("Environment not started. Call reset() first.")
 
-        rewards: dict[str, float | int] | None = None
-        if self._verifier is not None:
-            verifier_result = await self._verifier.verify()
-            rewards = verifier_result.rewards
+        rewards = await self._safe_verify()
         return rewards, self._reduce_reward(rewards)
 
     def _reduce_reward(self, rewards: dict[str, float | int] | None) -> float | None:
@@ -383,7 +497,10 @@ class AsyncTerminalGymEnv:
         return await self._tmux.capture_pane(capture_entire=full_buffer)
 
     async def close(self) -> None:
-        """Stop tmux and the underlying environment."""
+        """Stop tmux and the underlying environment (idempotent)."""
+        if not self._started:
+            return
+
         if self._tmux is not None:
             try:
                 await self._tmux.stop()

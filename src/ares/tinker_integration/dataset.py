@@ -88,6 +88,12 @@ class TerminalRLDataset:
     When ``len(tasks) == 1``, all groups use the same task (identical to the
     single-task working reference). With multiple tasks, each batch randomly
     samples ``groups_per_batch`` tasks.
+
+    ``builder_buffer`` adds extra builders per batch (for async mode only).
+    In async mode, the training loop needs exactly ``groups_per_batch`` non-None
+    groups per step.  If any rollout permanently fails (returns None), that builder
+    is lost forever.  The buffer provides spare builders so the training loop can
+    still accumulate enough groups even after some losses.
     """
 
     def __init__(
@@ -97,12 +103,14 @@ class TerminalRLDataset:
         num_batches: int,
         groups_per_batch: int,
         group_builder_thunk: Callable[[Any], TerminalEnvGroupBuilder],
+        builder_buffer: int = 0,
     ):
         if not tasks:
             raise ValueError("tasks list must not be empty")
         self._tasks = tasks
         self._num_batches = int(num_batches)
         self._groups_per_batch = int(groups_per_batch)
+        self._builder_buffer = max(0, int(builder_buffer))
         self._group_builder_thunk = group_builder_thunk
 
     def __len__(self) -> int:
@@ -112,11 +120,13 @@ class TerminalRLDataset:
         if index < 0 or index >= self._num_batches:
             raise IndexError("batch index out of range")
 
+        effective_groups = self._groups_per_batch + self._builder_buffer
+
         # Sample tasks for this batch. With a single task, all groups use it.
         if len(self._tasks) == 1:
-            sampled_tasks = [self._tasks[0]] * self._groups_per_batch
+            sampled_tasks = [self._tasks[0]] * effective_groups
         else:
-            sampled_tasks = random.choices(self._tasks, k=self._groups_per_batch)
+            sampled_tasks = random.choices(self._tasks, k=effective_groups)
 
         return [self._group_builder_thunk(task) for task in sampled_tasks]
 
@@ -141,6 +151,7 @@ class TerminalRLDatasetBuilder:
         num_batches: int = 1,
         max_trajectory_tokens: int = 32 * 1024,
         gym_env_kwargs: Mapping[str, Any] | None = None,
+        builder_buffer: int = 0,
     ):
         if not tasks:
             raise ValueError("tasks list must not be empty")
@@ -154,6 +165,7 @@ class TerminalRLDatasetBuilder:
         self._num_batches = int(num_batches)
         self._max_trajectory_tokens = int(max_trajectory_tokens)
         self._gym_env_kwargs: dict[str, Any] = dict(gym_env_kwargs or {})
+        self._builder_buffer = max(0, int(builder_buffer))
 
     async def __call__(self) -> tuple[TerminalRLDataset, None]:
         # Return (train_dataset, test_dataset|None)
@@ -190,6 +202,7 @@ class TerminalRLDatasetBuilder:
                 groups_per_batch=self._groups_per_batch,
                 num_batches=self._num_batches,
                 group_builder_thunk=thunk,
+                builder_buffer=self._builder_buffer,
             ),
             None,
         )

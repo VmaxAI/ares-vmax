@@ -40,12 +40,14 @@ class _MockEnvSpec:
         selector: registry.TaskSelector,
         container_factory: containers.ContainerFactory,
         tracker: stat_tracker.StatTracker | None = None,
+        snapshot_template_name: str | None = None,
     ) -> Any:
         """Return test data with received parameters."""
         return {
             "selector": selector,
             "container_factory": container_factory,
             "tracker": tracker,
+            "snapshot_template_name": snapshot_template_name,
         }
 
 

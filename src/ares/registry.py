@@ -261,6 +261,7 @@ class EnvironmentSpec(Protocol):
         selector: TaskSelector,
         container_factory: containers.ContainerFactory,
         tracker: stat_tracker.StatTracker | None = None,
+        snapshot_template_name: str | None = None,
     ) -> base.Environment:
         """Create and return an environment instance.
 
@@ -268,6 +269,7 @@ class EnvironmentSpec(Protocol):
             selector: Task selector to filter which tasks to include.
             container_factory: Factory for creating containers. Required.
             tracker: Statistics tracker for monitoring. Optional.
+            snapshot_template_name: Optional Daytona snapshot template with ``{name}`` placeholder.
 
         Returns:
             A configured environment instance ready for use in the RL loop.
@@ -407,8 +409,13 @@ def register_env(
                 selector: TaskSelector,
                 container_factory: containers.ContainerFactory,
                 tracker: stat_tracker.StatTracker | None = None,
+                snapshot_template_name: str | None = None,  # noqa: ARG002
             ) -> base.Environment:
                 """Delegate to the decorated function."""
+                # Note: snapshot_template_name is not forwarded to the wrapped function.
+                # Decorator-registered envs are simple custom registrations; snapshot
+                # support is handled by HarborSpec (and similar) which implement
+                # get_env() directly.
                 return func(
                     selector=selector,
                     container_factory=container_factory,
@@ -529,6 +536,7 @@ def make(
     *,
     container_factory: containers.ContainerFactory = docker.DockerContainer,
     tracker: stat_tracker.StatTracker | None = None,
+    snapshot_template_name: str | None = None,
 ) -> base.Environment:
     """Create an environment instance from a registered preset.
 
@@ -546,6 +554,8 @@ def make(
             - "sbv-mswea@2/8" - Shard 2 out of 8 total shards
         container_factory: Factory for creating containers. Defaults to DockerContainer.
         tracker: Statistics tracker for monitoring. Optional.
+        snapshot_template_name: Optional Daytona snapshot template with ``{name}`` placeholder.
+            When set, environments use pre-created snapshots instead of building from images.
 
     Returns:
         An environment instance configured according to the preset.
@@ -599,7 +609,12 @@ def make(
         tracker,
     )
 
-    env = spec.get_env(selector=selector, container_factory=container_factory, tracker=tracker)
+    env = spec.get_env(
+        selector=selector,
+        container_factory=container_factory,
+        tracker=tracker,
+        snapshot_template_name=snapshot_template_name,
+    )
 
     _LOGGER.debug("Successfully created environment from preset '%s'", preset_id_clean)
     return env

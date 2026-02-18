@@ -67,6 +67,7 @@ class CodeEnvironment(base.Environment[response.LLMResponse, request.LLMRequest 
         step_limit: int = 250,  # Same as mini-swe-agent default.
         prefix: str = "harbor_env",
         tracker: stat_tracker.StatTracker | None = None,
+        snapshot_template_name: str | None = None,
     ):
         self._tasks = tasks
         self._container_factory = container_factory
@@ -74,6 +75,7 @@ class CodeEnvironment(base.Environment[response.LLMResponse, request.LLMRequest 
         self._step_limit = step_limit
         self._prefix = prefix
         self._tracker = tracker if tracker is not None else stat_tracker.NullStatTracker()
+        self._snapshot_template_name = snapshot_template_name
 
         # We set the LLM client to a queue mediated client so that
         # we can return LLM requests in the reset and step methods.
@@ -258,6 +260,8 @@ class CodeEnvironment(base.Environment[response.LLMResponse, request.LLMRequest 
                     memory=self._current_task.config.environment.memory_mb // 1024,
                     disk=self._current_task.config.environment.storage_mb // 1024,
                 ),
+                snapshot_template_name=self._snapshot_template_name,
+                task_name=self._current_task.name,
             )
             await self._container.start()
         _LOGGER.debug("[%d] Container setup complete.", id(self))

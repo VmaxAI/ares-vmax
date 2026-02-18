@@ -1,8 +1,13 @@
-"""ARES + Tinker Terminal RL Training.
+"""ARES + Tinker RL Training.
 
-Train code agents using direct terminal control with Tinker's RL infrastructure.
-This uses the proven terminal-based architecture (tmux + JSON commands) that produces
-a clean learning signal, combined with ARES's Harbor task loading and preset system.
+Train code agents using Tinker's RL infrastructure with two harness modes:
+
+**Terminal harness** (default, ``--harness terminal``):
+    Direct tmux terminal control via JSON commands. Best for Terminus2-style agents.
+
+**Code-agent harness** (``--harness code-agent``):
+    ARES CodeEnvironment with QueueMediatedLLMClient. Works with any ARES agent
+    harness (Mini-SWE-Agent, Terminus2, etc.) on any preset.
 
 Prerequisites:
     - Set TINKER_API_KEY environment variable.
@@ -10,7 +15,7 @@ Prerequisites:
     - Install tinker, tinker-cookbook, and harbor dependencies.
 
 Usage:
-    # Single task (for verification — matches working reference behavior)
+    # Terminal harness — single task (for verification)
     uv run python examples/06_tinker_terminal_train.py \
         --task-dir WORKING_TINKER/terminal_rl/harbor_envs/devops_task \
         --model-name Qwen/Qwen3-30B-A3B-Instruct-2507 \
@@ -18,7 +23,7 @@ Usage:
         --log-path ./runs/devops_verify \
         --env docker
 
-    # Multi-task from ARES preset
+    # Terminal harness — multi-task from ARES preset (sync mode — default)
     uv run python examples/06_tinker_terminal_train.py \
         --preset tbench-terminus2 \
         --num-tasks 20 \
@@ -27,7 +32,17 @@ Usage:
         --log-path ./runs/tbench_multi \
         --env daytona
 
-    # With WandB logging and async rollouts
+    # Code-agent harness — Mini-SWE-Agent on SWE-bench Verified
+    uv run python examples/06_tinker_terminal_train.py \
+        --harness code-agent \
+        --preset sbv-mswea \
+        --num-tasks 20 \
+        --model-name Qwen/Qwen3-30B-A3B-Instruct-2507 \
+        --renderer-name qwen3 \
+        --log-path ./runs/sbv_mswea_code_agent \
+        --env daytona
+
+    # Async mode (pass --max-steps-off-policy to enable)
     uv run python examples/06_tinker_terminal_train.py \
         --preset tbench-terminus2 \
         --model-name Qwen/Qwen3-30B-A3B-Instruct-2507 \
@@ -49,14 +64,23 @@ from ares.tinker_integration import train
 
 def parse_args() -> config_mod.TrainingConfig:
     p = argparse.ArgumentParser(
-        description="ARES + Tinker Terminal RL Training",
+        description="ARES + Tinker RL Training",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    # Harness mode
+    p.add_argument(
+        "--harness",
+        type=str,
+        default="terminal",
+        choices=["terminal", "code-agent"],
+        help="Harness mode: 'terminal' (tmux + JSON) or 'code-agent' (ARES CodeEnvironment)",
     )
 
     # Task source (mutually exclusive)
     task_group = p.add_mutually_exclusive_group(required=True)
-    task_group.add_argument("--task-dir", type=str, help="Single task directory path")
-    task_group.add_argument("--preset", type=str, help="ARES preset name (e.g., tbench-terminus2)")
+    task_group.add_argument("--task-dir", type=str, help="Single task directory path (terminal harness only)")
+    task_group.add_argument("--preset", type=str, help="ARES preset name (e.g., sbv-mswea, tbench-terminus2)")
 
     p.add_argument("--num-tasks", type=int, default=None, help="Limit tasks from preset")
 
@@ -72,7 +96,7 @@ def parse_args() -> config_mod.TrainingConfig:
     p.add_argument("--lora-rank", type=int, default=32, help="LoRA rank")
     p.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature")
     p.add_argument("--max-tokens", type=int, default=4096, help="Max generation tokens")
-    p.add_argument("--group-size", type=int, default=5, help="Rollouts per task")
+    p.add_argument("--group-size", type=int, default=4, help="Rollouts per task")
     p.add_argument("--groups-per-batch", type=int, default=10, help="Task groups per batch")
     p.add_argument("--num-batches", type=int, default=15, help="Number of training batches")
     p.add_argument("--max-trajectory-tokens", type=int, default=32768, help="Max context tokens")
@@ -84,13 +108,43 @@ def parse_args() -> config_mod.TrainingConfig:
     p.add_argument("--kl-penalty-coef", type=float, default=0.0, help="KL penalty coefficient")
 
     # Sandbox safety and resources
-    p.add_argument("--auto-stop-minutes", type=int, default=30, help="Auto-stop idle sandboxes after N minutes")
+    p.add_argument("--auto-stop-minutes", type=int, default=270, help="Auto-stop idle sandboxes after N minutes")
     p.add_argument("--sandbox-cpus", type=int, default=None, help="CPU cores per sandbox (default: task config)")
     p.add_argument("--sandbox-memory-gb", type=int, default=None, help="RAM in GB per sandbox (default: task config)")
     p.add_argument("--sandbox-disk-gb", type=int, default=None, help="Disk in GB per sandbox (default: task config)")
+    p.add_argument(
+        "--snapshot-template",
+        type=str,
+        default=None,
+        help="Daytona snapshot template with {name} placeholder (e.g., 'ares__{name}'). "
+        "When set, uses pre-created snapshots instead of declarative image builds.",
+    )
+    p.add_argument(
+        "--max-concurrent-sandboxes",
+        type=int,
+        default=20,
+        help="Max concurrent sandbox *creations* (prevents Daytona 429 bursts; 0=no limit)",
+    )
 
-    # Async
-    p.add_argument("--max-steps-off-policy", type=int, default=None, help="Max steps off-policy (None=sync)")
+    # Async (sync is the default; pass --max-steps-off-policy to enable async)
+    p.add_argument(
+        "--max-steps-off-policy",
+        type=int,
+        default=None,
+        help="Enable async training with N max off-policy steps (e.g. 5). Omit for sync.",
+    )
+    p.add_argument(
+        "--async-rollout-retries",
+        type=int,
+        default=5,
+        help="Max retry attempts per group rollout before giving up (prevents builder loss in async mode)",
+    )
+    p.add_argument(
+        "--async-builder-buffer",
+        type=int,
+        default=2,
+        help="Extra builders per batch in async mode (compensates for permanently lost rollouts)",
+    )
 
     # Logging
     p.add_argument("--log-path", type=str, required=True, help="Path for logs and checkpoints")
@@ -104,6 +158,7 @@ def parse_args() -> config_mod.TrainingConfig:
     args = p.parse_args()
 
     return config_mod.TrainingConfig(
+        harness=args.harness,
         model_name=args.model_name,
         renderer_name=args.renderer_name,
         env_type=args.env,
@@ -126,7 +181,11 @@ def parse_args() -> config_mod.TrainingConfig:
         sandbox_cpus=args.sandbox_cpus,
         sandbox_memory_gb=args.sandbox_memory_gb,
         sandbox_disk_gb=args.sandbox_disk_gb,
+        snapshot_template_name=args.snapshot_template,
+        max_concurrent_sandboxes=args.max_concurrent_sandboxes or None,
         max_steps_off_policy=args.max_steps_off_policy,
+        async_rollout_retries=args.async_rollout_retries,
+        async_builder_buffer=args.async_builder_buffer,
         log_path=args.log_path,
         wandb_project=args.wandb_project,
         wandb_name=args.wandb_name,

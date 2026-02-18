@@ -1,8 +1,13 @@
 # ARES Tinker Integration
 
-Terminal-based RL training for code agents using [Tinker](https://tinker.build) + ARES's Harbor task system.
+RL training for code agents using [Tinker](https://tinker.build) + ARES's Harbor task system.
 
-The agent interacts with a tmux terminal inside a Daytona (or Docker) sandbox, emitting JSON-formatted keystroke commands and observing terminal output. Rewards are computed by Harbor's verifier at episode end.
+Two training scripts are available:
+
+- **`examples/06_tinker_terminal_train.py`** (argparse, `--flag` style) — Uses terminal-based envs (tmux + JSON commands) via `HarborTerminalTinkerEnv`. Best for **Terminus2** agent on terminal/devops tasks.
+- **`examples/05_tinker_train.py`** (chz, `key=value` style) — Uses ARES environments (`CodeEnvironment` + `QueueMediatedLLMClient`). Best for **Mini-SWE-Agent** on code modification / bug-fixing tasks (e.g., SWE-bench).
+
+This README documents the terminal-based integration (example 06). See example 05's docstring for its usage.
 
 ## Prerequisites
 
@@ -89,9 +94,14 @@ uv run python examples/06_tinker_terminal_train.py \
 
 ### Async Training
 
+Sync mode is the default and is proven to work. Pass `--max-steps-off-policy` to enable async mode.
+
 | Flag | Default | Description |
 |---|---|---|
-| `--max-steps-off-policy` | `None` | Max steps off-policy before sync (None = fully synchronous) |
+| `--max-steps-off-policy` | `None` | Max steps off-policy (None = sync mode, e.g. 5 for async) |
+| `--async-rollout-retries` | `5` | Retry attempts per group rollout before giving up |
+| `--async-builder-buffer` | `2` | Extra builders per batch to compensate for lost rollouts |
+| `--max-concurrent-sandboxes` | `20` | Cap concurrent sandbox creations (0 = no limit) |
 
 ### Logging and Checkpointing
 
@@ -153,7 +163,7 @@ tinker_cookbook.rl.train                 RL training loop
 
 The training loop survives transient infrastructure failures:
 
-- **Individual rollout failures** (Daytona rate limits, sandbox conflicts, download errors) are caught and the group returns `None`. Training continues with remaining successful rollouts.
+- **Individual rollout failures** (Daytona rate limits, sandbox conflicts, download errors) are retried with exponential backoff (up to `async_rollout_retries` attempts). If all retries fail, the group returns `None` and training continues with remaining successful rollouts.
 - **Entire batch failures** (all rollouts failed) skip the train step entirely — no weight update for that batch, training proceeds to the next.
 - **Gradient clipping** prevents training instability from outlier gradients.
 

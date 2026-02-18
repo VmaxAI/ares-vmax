@@ -15,6 +15,30 @@ from typing import Any, Protocol, TypedDict
 
 from ares.tinker_integration import terminal_env
 
+_CONTEXT_LEN_BUFFER = 10
+
+
+def _middle_truncate(model_input: Any, max_context_len: int) -> Any:
+    """Truncate model input from the middle when exceeding max context length.
+
+    Preserves both the beginning (task context / instruction) and end (recent
+    terminal state and actions) of the conversation while removing stale middle
+    history.  This is the same strategy used by the code-agent harness.
+    """
+    tinker = importlib.import_module("tinker")
+
+    num_tokens_to_truncate = model_input.length - max_context_len + _CONTEXT_LEN_BUFFER
+    if num_tokens_to_truncate <= 0:
+        return model_input
+
+    center_idx = model_input.length // 2
+    truncate_start_idx = center_idx - num_tokens_to_truncate // 2
+    truncate_end_idx = center_idx + num_tokens_to_truncate // 2
+
+    curr_ints = model_input.to_ints()
+    new_ints = curr_ints[:truncate_start_idx] + curr_ints[truncate_end_idx:]
+    return tinker.ModelInput.from_ints(new_ints)
+
 
 class TerminalActionParseError(Exception):
     pass
@@ -161,6 +185,10 @@ class HarborTerminalTinkerEnv:
             )
         return model_input, self.stop_condition
 
+    async def close(self) -> None:
+        """Close the underlying gym environment (idempotent)."""
+        await self._gym_env.close()
+
     async def step(self, action: list[int]) -> Any:
         tinker = importlib.import_module("tinker")
         step_result_cls = importlib.import_module("tinker_cookbook.rl.types").StepResult
@@ -225,6 +253,7 @@ class HarborTerminalTinkerEnv:
             reward = float(reduced) if isinstance(reduced, (int, float)) else 0.0
 
         # 5) Build next observation for continuing episodes.
+        context_truncated = 0.0
         if episode_done:
             next_observation = tinker.ModelInput.empty()
             # Close the sandbox to avoid resource leaks.
@@ -237,19 +266,12 @@ class HarborTerminalTinkerEnv:
             self._past_messages.append({"role": "user", "content": next_prompt})
             next_observation = self._renderer.build_generation_prompt(self._past_messages)
             if not self._fits_context_window(next_observation.length):
-                # Close the sandbox to avoid resource leaks.
-                await self._gym_env.close()
-                return step_result_cls(
-                    reward=0.0,
-                    episode_done=True,
-                    next_observation=tinker.ModelInput.empty(),
-                    next_stop_condition=self.stop_condition,
-                    metrics={
-                        "parse_success": float(bool(parse_success)),
-                        "json_ok": json_ok,
-                        "too_long": 1.0,
-                    },
-                )
+                # Context exceeds budget — middle-truncate (drop stale middle
+                # history, keep instruction at start + recent state at end)
+                # instead of killing the episode.  The agent keeps working.
+                max_prompt_tokens = self._max_trajectory_tokens - self._reserved_generation_tokens
+                next_observation = _middle_truncate(next_observation, max_prompt_tokens)
+                context_truncated = 1.0
 
         return step_result_cls(
             reward=reward,
@@ -260,5 +282,6 @@ class HarborTerminalTinkerEnv:
                 "parse_success": float(bool(parse_success)),
                 "json_ok": json_ok,
                 "num_commands": num_commands,
+                "context_truncated": context_truncated,
             },
         )
