@@ -143,6 +143,7 @@ async def run_training(config: config_mod.TrainingConfig) -> None:
             renderer_name=config.renderer_name,
             model_name_for_tokenizer=config.model_name,
             max_trajectory_tokens=config.max_trajectory_tokens,
+            max_tokens=config.max_tokens,
             gym_env_kwargs={
                 "auto_stop_minutes": config.auto_stop_minutes,
                 "sandbox_cpus": config.sandbox_cpus,

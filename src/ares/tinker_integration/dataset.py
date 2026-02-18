@@ -37,6 +37,7 @@ class TerminalEnvGroupBuilder:
         environment: Any,
         renderer: tinker_env.RendererProtocol,
         max_trajectory_tokens: int = 32 * 1024,
+        max_tokens: int = 4096,
         gym_env_kwargs: dict[str, Any] | None = None,
     ):
         self._task = task
@@ -47,6 +48,7 @@ class TerminalEnvGroupBuilder:
         self._environment = environment
         self._renderer = renderer
         self._max_trajectory_tokens = int(max_trajectory_tokens)
+        self._max_tokens = int(max_tokens)
         self._gym_env_kwargs = gym_env_kwargs or {}
 
     async def make_envs(self) -> Sequence[tinker_env.HarborTerminalTinkerEnv]:
@@ -66,6 +68,7 @@ class TerminalEnvGroupBuilder:
                     gym_env=gym,
                     renderer=self._renderer,
                     max_trajectory_tokens=self._max_trajectory_tokens,
+                    reserved_generation_tokens=self._max_tokens,
                 )
             )
         return envs
@@ -150,6 +153,7 @@ class TerminalRLDatasetBuilder:
         groups_per_batch: int = 1,
         num_batches: int = 1,
         max_trajectory_tokens: int = 32 * 1024,
+        max_tokens: int = 4096,
         gym_env_kwargs: Mapping[str, Any] | None = None,
         builder_buffer: int = 0,
     ):
@@ -164,6 +168,7 @@ class TerminalRLDatasetBuilder:
         self._groups_per_batch = int(groups_per_batch)
         self._num_batches = int(num_batches)
         self._max_trajectory_tokens = int(max_trajectory_tokens)
+        self._max_tokens = int(max_tokens)
         self._gym_env_kwargs: dict[str, Any] = dict(gym_env_kwargs or {})
         self._builder_buffer = max(0, int(builder_buffer))
 
@@ -184,6 +189,7 @@ class TerminalRLDatasetBuilder:
         gym_env_kwargs = self._gym_env_kwargs
         group_size = self._group_size
         max_trajectory_tokens = self._max_trajectory_tokens
+        max_tokens = self._max_tokens
         environment = self._environment
 
         def thunk(task: Any) -> TerminalEnvGroupBuilder:
@@ -193,6 +199,7 @@ class TerminalRLDatasetBuilder:
                 environment=environment,
                 renderer=renderer,
                 max_trajectory_tokens=max_trajectory_tokens,
+                max_tokens=max_tokens,
                 gym_env_kwargs=gym_env_kwargs,
             )
 
