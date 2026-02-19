@@ -167,18 +167,24 @@ uv run python examples/06_tinker_terminal_train.py \
     --load-checkpoint-path ./runs/sbv_sync/checkpoints/batch_10
 ```
 
-### With WandB run tracking
+### Resuming a WandB run
+
+To continue logging to a previous WandB run (e.g., after a crash or checkpoint resume), set `WANDB_RESUME` and `WANDB_RUN_ID` environment variables. The run ID is shown in the WandB UI or in the initial training logs.
 
 ```bash
+WANDB_RESUME=must WANDB_RUN_ID=<previous-run-id> \
 uv run python examples/06_tinker_terminal_train.py \
     --preset sbv-terminus2 \
     --model-name Qwen/Qwen3-4B-Instruct-2507 \
     --renderer-name qwen3 \
-    --log-path ./runs/sbv_tracked \
+    --log-path ./runs/sbv_resumed \
     --env daytona \
+    --load-checkpoint-path ./runs/sbv_sync/checkpoints/batch_10 \
     --wandb-project ares-tinker \
     --wandb-name "sbv-experiment-1"
 ```
+
+`WANDB_RESUME=must` requires the run to already exist (fails if not found). Use `WANDB_RESUME=allow` to create a new run if the ID doesn't exist.
 
 ## CLI Reference
 
