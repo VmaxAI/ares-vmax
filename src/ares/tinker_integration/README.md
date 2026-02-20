@@ -86,6 +86,47 @@ uv run python examples/06_tinker_terminal_train.py \
     --max-tokens 4096
 ```
 
+## Training Results
+
+Results from async CISPO training on 50 SWE-bench Verified Terminus2 tasks (`sbv-terminus2` preset) with `Qwen/Qwen3-4B-Instruct-2507`, using Daytona sandboxes with snapshots. Training command:
+
+```bash
+uv run python examples/06_tinker_terminal_train.py \
+    --preset sbv-terminus2 \
+    --num-tasks 50 \
+    --model-name Qwen/Qwen3-4B-Instruct-2507 \
+    --renderer-name qwen3 \
+    --log-path ./runs/sbv_terminus2_snap_async_cispo \
+    --env daytona \
+    --snapshot-template "ares__{name}" \
+    --max-steps-off-policy 3 \
+    --loss-fn cispo \
+    --learning-rate 4e-5 \
+    --lora-rank 32 \
+    --group-size 6 \
+    --groups-per-batch 32 \
+    --num-batches 50 \
+    --max-tokens 4096 \
+    --wandb-project ares-tinker \
+    --wandb-name "sbv-terminus2-snap-async-cispo"
+```
+
+### Aggregate reward across all tasks
+
+The average reward increases over training steps, showing the model is learning to solve tasks:
+
+![Aggregate reward over training steps](assets/reward_all_tasks.png)
+
+### Per-task reward curves
+
+Some tasks show clear learning (reward climbing from 0 to 0.6-0.8):
+
+![Tasks with successful learning curves](assets/reward_good_tasks.png)
+
+Other tasks remain unsolved throughout training (flat at 0), which is expected — not all SWE-bench tasks are solvable by a 4B model:
+
+![Tasks that remained unsolved](assets/reward_bad_tasks.png)
+
 ## Creating Snapshots
 
 Snapshots are pre-built Daytona sandbox images that skip the declarative build step, making sandbox creation much faster. They are optional — omit `--snapshot-template` to use standard image builds.
