@@ -4,14 +4,21 @@ Ported from examples/05_tinker_train.py (TinkerCompatibleEnv pattern). Provides 
 ``AresCodeTinkerEnv`` class that wraps an ARES ``CodeEnvironment`` (created via
 ``ares.make()``) as a Tinker-compatible RL environment, enabling training with any
 ARES agent harness (Mini-SWE-Agent, Terminus2, etc.) on any preset.
+
+Context overflow is handled by terminating the episode with ``reward=0`` and
+``too_long=1.0`` (same strategy as the terminal harness) instead of middle-truncating
+the token sequence.  Middle truncation was removed because it can cause infinite
+rollouts that never produce a gradient step.
 """
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Sequence
 import contextlib
 import importlib
 import logging
+import random
 from typing import Any
 
 import ares
@@ -20,11 +27,15 @@ from ares.containers import daytona
 from ares.containers import docker
 from ares.llms import response
 from ares.tinker_integration import dataset
+from ares.tinker_integration import terminal_env
 from ares.tinker_integration import tinker_env
 
 _LOGGER = logging.getLogger(__name__)
 
-CONTEXT_LEN_BUFFER = 10
+# Retry config for sandbox creation (mirrors terminal_env's strategy).
+_SANDBOX_START_MAX_RETRIES = 5
+_SANDBOX_START_BASE_DELAY = 60.0  # seconds
+_SANDBOX_START_MAX_DELAY = 300.0  # seconds
 
 
 def _get_text_content(message: dict[str, Any]) -> str:
@@ -33,27 +44,6 @@ def _get_text_content(message: dict[str, Any]) -> str:
     if isinstance(content, str):
         return content
     return "".join(p["text"] for p in content if p["type"] == "text")  # type: ignore[index]
-
-
-def _middle_truncate(model_input: Any, max_context_len: int) -> Any:
-    """Truncate model input from the middle when exceeding max context length.
-
-    Preserves both the beginning (task context) and end (recent history)
-    of the conversation while removing middle content.
-    """
-    tinker = importlib.import_module("tinker")
-
-    num_tokens_to_truncate = model_input.length - max_context_len + CONTEXT_LEN_BUFFER
-    if num_tokens_to_truncate <= 0:
-        return model_input
-
-    center_idx = model_input.length // 2
-    truncate_start_idx = center_idx - num_tokens_to_truncate // 2
-    truncate_end_idx = center_idx + num_tokens_to_truncate // 2
-
-    curr_ints = model_input.to_ints()
-    new_ints = curr_ints[:truncate_start_idx] + curr_ints[truncate_end_idx:]
-    return tinker.ModelInput.from_ints(new_ints)
 
 
 def _get_container_factory(env_type: str) -> containers.ContainerFactory:
@@ -74,8 +64,9 @@ class AresCodeTinkerEnv:
     - The assistant text is converted to an ARES LLMResponse and fed back to the env.
     - Reward comes from the ARES environment's reward computation.
 
-    This enables training any ARES agent harness (Mini-SWE-Agent, Terminus2, etc.)
-    with Tinker's RL infrastructure.
+    Context overflow terminates the episode with ``reward=0`` and ``too_long=1.0``
+    (same strategy as the terminal harness).  This prevents infinite rollouts that
+    would otherwise block gradient steps.
     """
 
     def __init__(
@@ -85,6 +76,7 @@ class AresCodeTinkerEnv:
         renderer: tinker_env.RendererProtocol,
         max_trajectory_tokens: int = 32 * 1024,
         max_tokens: int = 4096,
+        task_name: str = "unknown",
     ):
         try:  # pragma: no cover
             importlib.import_module("tinker")
@@ -96,7 +88,13 @@ class AresCodeTinkerEnv:
         self._renderer = renderer
         self._max_trajectory_tokens = int(max_trajectory_tokens)
         self._max_tokens = max(0, int(max_tokens))
+        self._task_name = task_name
+        self._step_count = 0
         self._closed = False
+
+    def _fits_context_window(self, prompt_tokens: int) -> bool:
+        """Return True if prompt + reserved generation tokens fits context window."""
+        return (int(prompt_tokens) + self._max_tokens) <= self._max_trajectory_tokens
 
     def _ts_to_model_input(self, ts: ares.TimeStep) -> Any:  # type: ignore[type-arg]
         """Convert a TimeStep's observation (LLMRequest) to a tinker.ModelInput."""
@@ -108,28 +106,65 @@ class AresCodeTinkerEnv:
         messages: list[dict[str, Any]] = [
             {"role": msg["role"], "content": msg.get("content", "")} for msg in ts.observation.messages
         ]
-        model_input = self._renderer.build_generation_prompt(messages)
-        return self._fit_context(model_input)
-
-    def _fit_context(self, model_input: Any) -> Any:
-        """Apply middle truncation when exceeding context budget."""
-        max_context = self._max_trajectory_tokens - self._max_tokens
-        if model_input.length > max_context:
-            model_input = _middle_truncate(model_input, max_context)
-        return model_input
+        return self._renderer.build_generation_prompt(messages)
 
     @property
     def stop_condition(self) -> tinker_env.StopCondition:
         return self._renderer.get_stop_sequences()
 
     async def initial_observation(self) -> tuple[Any, tinker_env.StopCondition]:
-        await self._env.__aenter__()
-        ts = await self._env.reset()
-        return self._ts_to_model_input(ts), self.stop_condition
+        _LOGGER.info("ENV START | task=%s | harness=code-agent", self._task_name)
+
+        # Gate sandbox creation with the shared concurrency semaphore (same one
+        # the terminal harness uses) and retry transient Daytona errors.
+        sem = terminal_env._sandbox_creation_semaphore
+        for attempt in range(1, _SANDBOX_START_MAX_RETRIES + 1):
+            try:
+                if sem is not None:
+                    async with sem:
+                        await self._env.__aenter__()
+                        ts = await self._env.reset()
+                else:
+                    await self._env.__aenter__()
+                    ts = await self._env.reset()
+                break
+            except Exception as exc:
+                if not terminal_env._is_transient_error(exc) or attempt == _SANDBOX_START_MAX_RETRIES:
+                    raise
+                delay = min(_SANDBOX_START_BASE_DELAY * (2 ** (attempt - 1)), _SANDBOX_START_MAX_DELAY)
+                delay *= 0.5 + random.random()  # jitter
+                _LOGGER.warning(
+                    "ENV START RETRY | task=%s | attempt=%d/%d | retrying in %.0fs | %s: %s",
+                    self._task_name,
+                    attempt,
+                    _SANDBOX_START_MAX_RETRIES,
+                    delay,
+                    type(exc).__name__,
+                    exc,
+                )
+                await asyncio.sleep(delay)
+
+        self._step_count = 0
+
+        model_input = self._ts_to_model_input(ts)
+        if not self._fits_context_window(model_input.length):
+            raise ValueError(
+                f"Initial prompt too long for context window: "
+                f"{model_input.length} prompt + {self._max_tokens} reserved "
+                f"> {self._max_trajectory_tokens}"
+            )
+        _LOGGER.info(
+            "ENV READY | task=%s | prompt_tokens=%d/%d",
+            self._task_name,
+            model_input.length,
+            self._max_trajectory_tokens,
+        )
+        return model_input, self.stop_condition
 
     async def step(self, action: list[int]) -> Any:
         tinker = importlib.import_module("tinker")
         step_result_cls = importlib.import_module("tinker_cookbook.rl.types").StepResult
+        self._step_count += 1
 
         # Decode assistant message using renderer.
         message, parse_success = self._renderer.parse_response(action)
@@ -147,13 +182,49 @@ class AresCodeTinkerEnv:
 
         episode_done = ts.last()
         reward = ts.reward or 0.0
+        too_long = 0.0
 
         if episode_done:
+            _LOGGER.info(
+                "ENV DONE  | task=%s | step=%d | reason=task_complete | reward=%.3f",
+                self._task_name,
+                self._step_count,
+                reward,
+            )
             await self._env.__aexit__(None, None, None)
             self._closed = True
             next_observation = tinker.ModelInput.empty()
         else:
             next_observation = self._ts_to_model_input(ts)
+            if not self._fits_context_window(next_observation.length):
+                # Context exceeds budget — terminate episode with reward=0.
+                # This bounds rollout length and prevents infinite loops when
+                # the agent never finishes within the context window.
+                _LOGGER.info(
+                    "ENV DONE  | task=%s | step=%d | reason=too_long | context=%d/%d "
+                    "(prompt=%d + reserved_gen=%d > max=%d)",
+                    self._task_name,
+                    self._step_count,
+                    next_observation.length,
+                    self._max_trajectory_tokens,
+                    next_observation.length,
+                    self._max_tokens,
+                    self._max_trajectory_tokens,
+                )
+                too_long = 1.0
+                episode_done = True
+                reward = 0.0
+                next_observation = tinker.ModelInput.empty()
+                await self._env.__aexit__(None, None, None)
+                self._closed = True
+            else:
+                _LOGGER.debug(
+                    "ENV STEP  | task=%s | step=%d | tokens=%d/%d",
+                    self._task_name,
+                    self._step_count,
+                    next_observation.length,
+                    self._max_trajectory_tokens,
+                )
 
         return step_result_cls(
             reward=reward,
@@ -163,6 +234,7 @@ class AresCodeTinkerEnv:
             metrics={
                 "parse_success": float(bool(parse_success)),
                 "reward": reward,
+                "too_long": too_long,
             },
         )
 
@@ -171,6 +243,7 @@ class AresCodeTinkerEnv:
         if self._closed:
             return
         self._closed = True
+        _LOGGER.debug("ENV CLOSE | task=%s | step=%d", self._task_name, self._step_count)
         with contextlib.suppress(Exception):
             await self._env.__aexit__(None, None, None)
 
@@ -210,10 +283,11 @@ class AresEnvGroupBuilder:
         importlib.import_module("tinker")
         importlib.import_module("tinker_cookbook")
 
+        task_name = f"{self._preset_name}:{self._task_idx}"
         envs: list[AresCodeTinkerEnv] = []
         for _ in range(self._group_size):
             env = ares.make(
-                f"{self._preset_name}:{self._task_idx}",
+                task_name,
                 container_factory=self._container_factory,
                 snapshot_template_name=self._snapshot_template_name,
             )
@@ -223,6 +297,7 @@ class AresEnvGroupBuilder:
                     renderer=self._renderer,
                     max_trajectory_tokens=self._max_trajectory_tokens,
                     max_tokens=self._max_tokens,
+                    task_name=task_name,
                 )
             )
         return envs

@@ -53,6 +53,34 @@ async def _create_sandbox_from_snapshot_with_retry(
 
 @tenacity.retry(
     retry=tenacity.retry_if_exception_type(daytona.common.errors.DaytonaError),
+    stop=tenacity.stop_after_attempt(5),
+    wait=tenacity.wait_exponential_jitter(max=60),
+    before_sleep=tenacity.before_sleep_log(_LOGGER, logging.INFO),
+)
+async def _upload_files_with_retry(sbx: daytona.AsyncSandbox, files: list[daytona.FileUpload]) -> None:
+    try:
+        await sbx.fs.upload_files(files=files)
+    except daytona.common.errors.DaytonaError as e:
+        _LOGGER.warning("Error uploading files to sandbox %s in state [%s]: %s", sbx.id, sbx.state, e)
+        raise
+
+
+@tenacity.retry(
+    retry=tenacity.retry_if_exception_type(daytona.common.errors.DaytonaError),
+    stop=tenacity.stop_after_attempt(5),
+    wait=tenacity.wait_exponential_jitter(max=60),
+    before_sleep=tenacity.before_sleep_log(_LOGGER, logging.INFO),
+)
+async def _download_files_with_retry(sbx: daytona.AsyncSandbox, files: list[daytona.FileDownloadRequest]) -> None:
+    try:
+        await sbx.fs.download_files(files=files)
+    except daytona.common.errors.DaytonaError as e:
+        _LOGGER.warning("Error downloading files from sandbox %s in state [%s]: %s", sbx.id, sbx.state, e)
+        raise
+
+
+@tenacity.retry(
+    retry=tenacity.retry_if_exception_type(daytona.common.errors.DaytonaError),
     stop=tenacity.stop_after_attempt(10),
     wait=tenacity.wait_exponential_jitter(max=60),
     before_sleep=tenacity.before_sleep_log(_LOGGER, logging.INFO),
@@ -222,7 +250,7 @@ class DaytonaContainer(containers.Container):
         ]
 
         if file_uploads:
-            await self._sbx.fs.upload_files(files=file_uploads)
+            await _upload_files_with_retry(self._sbx, file_uploads)
 
     async def download_files(self, remote_paths: list[str], local_paths: list[pathlib.Path]) -> None:
         """Download files from the container."""
@@ -238,7 +266,7 @@ class DaytonaContainer(containers.Container):
         ]
 
         if file_downloads:
-            await self._sbx.fs.download_files(files=file_downloads)
+            await _download_files_with_retry(self._sbx, file_downloads)
 
     @classmethod
     def from_image(

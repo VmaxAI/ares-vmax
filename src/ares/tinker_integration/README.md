@@ -320,7 +320,7 @@ Wraps ARES's `CodeEnvironment` with `QueueMediatedLLMClient`. The agent (Mini-SW
 - Requires `--preset` (not `--task-dir`)
 - Works with any ARES agent harness
 - Episode ends on step limit (250), `task_complete`, or context overflow
-- Uses ARES's standard middle-truncation for context management
+- Context overflow terminates the episode with reward=0 (`too_long`), same as the terminal harness
 
 ## Architecture
 
