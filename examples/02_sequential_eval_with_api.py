@@ -36,7 +36,7 @@ async def main():
     # `sbv-mswea` is SWE-bench Verified with mini-swe-agent.
     # `:0` means load only the first task.
     # By default, ares.make will use local Docker containers.
-    
+
     from ares.containers import daytona as ares_daytona
     async with ares.make("sbv-mswea:0", container_factory=ares_daytona.DaytonaContainer) as env:
     #async with ares.make("sbv-mswea:0") as env:

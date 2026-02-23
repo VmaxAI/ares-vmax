@@ -156,7 +156,7 @@ class HarborTerminalTinkerEnv:
         try:  # pragma: no cover
             importlib.import_module("tinker")
             importlib.import_module("tinker_cookbook")
-        except Exception as e:  # pragma: no cover
+        except ImportError as e:  # pragma: no cover
             raise ImportError("HarborTerminalTinkerEnv requires 'tinker' + 'tinker-cookbook' to be installed.") from e
 
         self._gym_env = gym_env

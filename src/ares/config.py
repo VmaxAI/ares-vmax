@@ -47,3 +47,13 @@ class _Config(pydantic_settings.BaseSettings):
 
 
 CONFIG = _Config()  # type: ignore
+
+
+def reload() -> None:
+    """Re-read environment variables and recreate the global CONFIG singleton.
+
+    Useful when env vars are modified at runtime (e.g. training scripts that
+    override ``DAYTONA_AUTO_STOP_INTERVAL`` before containers are created).
+    """
+    global CONFIG
+    CONFIG = _Config()  # type: ignore

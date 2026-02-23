@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import inspect
 import logging
 import os
 import random
@@ -36,8 +37,9 @@ def _make_harbor_env_config(env_type: str, *, snapshot_template_name: str | None
         if snapshot_template_name is not None:
             kwargs["snapshot_template_name"] = snapshot_template_name
         return env_cfg_cls(type=env_type, kwargs=kwargs)
-    except Exception as e:  # pragma: no cover
+    except ImportError as e:  # pragma: no cover
         raise ImportError(
+            "Failed to import 'harbor.models.trial.config'. "
             "tinker_integration requires the optional 'harbor' dependency. "
             "Install it in your environment (and ensure it is importable) to run training."
         ) from e
@@ -92,10 +94,9 @@ async def run_training(config: config_mod.TrainingConfig) -> None:
     # and also acts as a belt-and-suspenders for the terminal harness.
     if config.env_type == "daytona":
         os.environ["DAYTONA_AUTO_STOP_INTERVAL"] = str(config.auto_stop_minutes)
-        # Force re-creation of the frozen config with the new env var.
         from ares import config as ares_config_mod
 
-        ares_config_mod.CONFIG = ares_config_mod._Config()  # type: ignore[misc]
+        ares_config_mod.reload()
         _LOGGER.info("Set Daytona auto-stop interval to %d minutes", config.auto_stop_minutes)
 
     # In async mode, add a builder buffer so each batch produces a few extra builders.
@@ -297,40 +298,51 @@ async def run_training(config: config_mod.TrainingConfig) -> None:
     # None (caught above), compute_trajectory_metrics crashes with
     # ZeroDivisionError.  We filter Nones and skip the train step if empty.
     _original_do_train_step = tinker_train.do_train_step_and_get_sampling_client
+    _do_train_step_sig = inspect.signature(_original_do_train_step)
+
+    # Validate that the parameters we depend on exist in the current Tinker version.
+    _required_train_step_params = {"training_client", "env_group_builders_P", "trajectory_groups_P"}
+    _actual_params = set(_do_train_step_sig.parameters)
+    if not _required_train_step_params.issubset(_actual_params):
+        missing = _required_train_step_params - _actual_params
+        raise RuntimeError(
+            f"do_train_step_and_get_sampling_client signature changed: missing {missing}. "
+            f"Actual parameters: {list(_do_train_step_sig.parameters)}. "
+            f"The monkey-patch in train.py needs to be updated."
+        )
 
     async def _safe_do_train_step(*args: Any, **kwargs: Any) -> Any:
-        # Positional indices match do_train_step_and_get_sampling_client(cfg,
-        # i_batch, training_client, kl_reference_client, tokenizer,
-        # env_group_builders_P[5], trajectory_groups_P[6]).
-        args_list = list(args)
-        trajectory_groups = args_list[6] if len(args_list) > 6 else kwargs.get("trajectory_groups_P", [])
+        # Bind positional + keyword args to named parameters so we can
+        # robustly access them by name regardless of call-site conventions.
+        bound = _do_train_step_sig.bind(*args, **kwargs)
+        bound.apply_defaults()
+
+        trajectory_groups: list[Any] = bound.arguments["trajectory_groups_P"]
 
         # Filter out None trajectory groups (from crashed rollouts) and keep
         # env_group_builders_P in sync so the two lists stay aligned.
         if any(g is None for g in trajectory_groups):
             original_count = len(trajectory_groups)
-            env_builders = args_list[5] if len(args_list) > 5 else kwargs.get("env_group_builders_P", [])
+            env_builders: list[Any] = bound.arguments["env_group_builders_P"]
             pairs = [(b, g) for b, g in zip(env_builders, trajectory_groups, strict=False) if g is not None]
-            filtered_builders = [p[0] for p in pairs]
-            filtered_groups = [p[1] for p in pairs]
-            if len(args_list) > 6:
-                args_list[5], args_list[6] = filtered_builders, filtered_groups
-            trajectory_groups = filtered_groups
+            bound.arguments["env_group_builders_P"] = [p[0] for p in pairs]
+            bound.arguments["trajectory_groups_P"] = [p[1] for p in pairs]
+            trajectory_groups = bound.arguments["trajectory_groups_P"]
             _LOGGER.warning(
                 "TRAIN STEP | filtered %d None groups (%d -> %d valid)",
-                original_count - len(filtered_groups),
+                original_count - len(trajectory_groups),
                 original_count,
-                len(filtered_groups),
+                len(trajectory_groups),
             )
 
         if not trajectory_groups:
             _LOGGER.warning("TRAIN STEP | all rollouts failed — skipping (no weight update)")
-            training_client_arg = args_list[2] if len(args_list) > 2 else kwargs["training_client"]
-            sampling_client = await training_client_arg.save_weights_and_get_sampling_client_async()
+            training_client = bound.arguments["training_client"]
+            sampling_client = await training_client.save_weights_and_get_sampling_client_async()
             return sampling_client, {}
 
         _LOGGER.info("TRAIN STEP | training on %d groups", len(trajectory_groups))
-        return await _original_do_train_step(*args_list, **kwargs)
+        return await _original_do_train_step(*bound.args, **bound.kwargs)
 
     tinker_train.do_train_step_and_get_sampling_client = _safe_do_train_step  # type: ignore[assignment]
 

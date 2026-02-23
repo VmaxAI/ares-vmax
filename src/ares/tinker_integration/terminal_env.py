@@ -62,8 +62,9 @@ def _import_harbor() -> dict[str, Any]:
             "Task": importlib.import_module("harbor.models.task.task").Task,
             "Verifier": importlib.import_module("harbor.verifier.verifier").Verifier,
         }
-    except Exception as e:  # pragma: no cover
+    except ImportError as e:  # pragma: no cover
         raise ImportError(
+            "Failed to import 'harbor' modules. "
             "tinker_integration requires the optional 'harbor' dependency. "
             "Install it in your environment (and ensure it is importable) to use these recipes."
         ) from e
