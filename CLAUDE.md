@@ -19,6 +19,9 @@ uv sync
 # Install with specific groups
 uv sync --group dev
 uv sync --group examples
+
+# Install with optional extras (e.g., tinker RL training)
+uv sync --extra tinker
 ```
 
 ### Testing
@@ -62,9 +65,12 @@ uv run -m examples.02_sequential_eval_with_api
 
 # Parallel eval with API
 uv run -m examples.03_parallel_eval_with_api
+
+# RL training with Tinker (terminal harness)
+uv run python examples/06_tinker_terminal_train.py --preset sbv-terminus2 --model-name Qwen/Qwen3-4B-Instruct-2507 --renderer-name qwen3 --log-path ./runs/test --env docker
 ```
 
-Examples demonstrate basic usage patterns and require the examples dependency group.
+Examples demonstrate basic usage patterns and require the examples dependency group (`uv sync --group examples`).
 
 ## Public API
 
@@ -134,12 +140,15 @@ class CodeAgent(Protocol):
     async def run(self, task: str) -> None
 ```
 
-**Main Implementation:**
+**Implementations:**
 - `MiniSWECodeAgent` (`mini_swe_agent.py`) - Wraps the mini-swe-agent library
   - Uses Jinja2-rendered system/instance templates
   - Parses bash commands from markdown code blocks
   - Handles format errors, timeouts, and submission signals
   - Tracks performance statistics via `StatTracker`
+- `Terminus2Agent` (`terminus2/terminus2_agent.py`) - Terminal-based agent that controls tmux sessions via JSON/XML commands
+  - JSON commands: `{"commands": [{"keystrokes": "...", "duration": N}], "task_complete": bool}`
+  - Includes JSON and XML parsers with fuzzy extraction for malformed model output
 
 **Factory Pattern:**
 - `CodeAgentFactory[T]` protocol creates agents with container and LLM client dependencies
@@ -201,7 +210,24 @@ Go-based HTTP proxy that acts as man-in-the-middle between code agents and LLM A
 - `POST /respond` - Environment sends responses back to agents
 - Has its own test suite: `make test` in `ares-proxy/`
 
-#### 6. Supporting Modules
+#### 6. Tinker Integration (`src/ares/tinker_integration/`)
+
+RL training pipeline using [Tinker](https://tinker.build) for gradient computation. Two harness modes:
+- **Terminal harness** (default): Model controls tmux via JSON commands, reward from Harbor Verifier
+- **Code-agent harness**: Wraps `CodeEnvironment` + `QueueMediatedLLMClient`, works with any ARES agent
+
+**Key modules:**
+- `train.py` - `run_training()` entry point: orchestration, monkey-patches (grad clipping, error-resilient rollouts, wandb config)
+- `dataset.py` - `TerminalRLDatasetBuilder` / `AresRLDatasetBuilder`: multi-task dataset, GRPO group builders
+- `terminal_env.py` - `AsyncTerminalGymEnv`: gym-like wrapper over Harbor + tmux with reward verification
+- `tinker_env.py` - `HarborTerminalTinkerEnv`: tinker-cookbook RL adapter for terminal harness
+- `ares_env.py` - `AresCodeTinkerEnv`: code-agent harness adapter
+- `config.py` - `TrainingConfig` dataclass with all training parameters
+- `create_snapshots.py` - Bulk Daytona snapshot creation for faster sandbox startup
+
+**CLI entry point**: `examples/06_tinker_terminal_train.py` (argparse). Supports sync (on-policy, default) and async (off-policy, `--max-steps-off-policy`) training modes. See `src/ares/tinker_integration/README.md` for full CLI reference and training examples.
+
+#### 7. Supporting Modules
 
 **Registry (`registry.py`, `presets.py`):**
 - `make()`, `info()`, `register_preset()`, `@register_env` decorator
@@ -213,7 +239,7 @@ Go-based HTTP proxy that acts as man-in-the-middle between code agents and LLM A
 - Required: `DAYTONA_API_KEY`, `DAYTONA_API_URL`, `CHAT_COMPLETION_API_KEY`
 - Auto-detects user from environment variables for logging/tracking
 
-**Statistics Tracking (`stat_tracker.py`):**
+**Experiment Tracking (`src/ares/experiment_tracking/`):**
 - `StatTracker` Protocol with context manager for timing: `with tracker.timeit(name):`
 - Implementations: `NullStatTracker` (no-op), `LoggingStatTracker`, `TensorboardStatTracker`
 - Non-intrusive performance monitoring

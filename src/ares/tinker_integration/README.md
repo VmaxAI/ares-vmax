@@ -10,8 +10,8 @@ RL training for code agents using [Tinker](https://tinker.build) + ARES's [Harbo
 ## Prerequisites
 
 ```bash
-# Python packages (in addition to ares itself)
-pip install tinker tinker-cookbook harbor
+# Install tinker dependencies
+uv sync --extra tinker
 
 # Required environment variables
 export TINKER_API_KEY="..."        # Tinker service API key
