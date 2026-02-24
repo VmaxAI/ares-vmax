@@ -156,8 +156,10 @@ async def create_container(
     image_name: str | None = None,
     dockerfile_path: pathlib.Path | str | None = None,
     resources: containers.Resources | None = None,
+    snapshot_template_name: str | None = None,
+    task_name: str | None = None,
 ) -> containers.Container:
-    """Create a container from an image or Dockerfile.
+    """Create a container from an image, Dockerfile, or snapshot.
 
     Args:
         container_factory: Factory for creating containers.
@@ -165,15 +167,26 @@ async def create_container(
         image_name: Optional image name to use.
         dockerfile_path: Optional path to Dockerfile.
         resources: Optional resource constraints.
+        snapshot_template_name: Optional snapshot template with ``{name}`` placeholder.
+            If set (along with task_name) and the factory supports ``from_snapshot()``,
+            the snapshot path is used instead of image/dockerfile.
+        task_name: Task name used to format snapshot_template_name.
 
     Returns:
         A created container (not yet started).
 
     Raises:
-        ValueError: If neither image_name nor dockerfile_path is specified.
+        ValueError: If neither image_name nor dockerfile_path is specified (when not using snapshots).
     """
     timestamp = int(time.time())
     unique_id = str(uuid.uuid4())[:8]  # Use first 8 chars of UUID for brevity
+
+    # Snapshot path: if template + task_name + factory supports it, use snapshot.
+    if snapshot_template_name is not None and task_name is not None and hasattr(container_factory, "from_snapshot"):
+        snapshot_name = snapshot_template_name.format(name=task_name)
+        _LOGGER.info("Using snapshot: %s", snapshot_name)
+        container_name = f"ares.{container_prefix}.snap.{timestamp}.{unique_id}"
+        return container_factory.from_snapshot(snapshot_name=snapshot_name, name=container_name)  # type: ignore[attr-defined]
 
     if image_name is not None:
         image_name_short = image_name.split("/")[-1].removesuffix(":latest").split(".")[-1]

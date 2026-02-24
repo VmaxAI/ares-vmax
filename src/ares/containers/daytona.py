@@ -41,6 +41,46 @@ async def _create_sandbox_with_retry(params: daytona.CreateSandboxFromImageParam
 
 @tenacity.retry(
     retry=tenacity.retry_if_exception_type(daytona.common.errors.DaytonaError),
+    stop=tenacity.stop_after_attempt(3),
+    wait=tenacity.wait_exponential_jitter(max=60),
+    before_sleep=tenacity.before_sleep_log(_LOGGER, logging.INFO),
+)
+async def _create_sandbox_from_snapshot_with_retry(
+    params: daytona.CreateSandboxFromSnapshotParams,
+) -> daytona.AsyncSandbox:
+    return await _get_daytona_client().create(params=params)
+
+
+@tenacity.retry(
+    retry=tenacity.retry_if_exception_type(daytona.common.errors.DaytonaError),
+    stop=tenacity.stop_after_attempt(5),
+    wait=tenacity.wait_exponential_jitter(max=60),
+    before_sleep=tenacity.before_sleep_log(_LOGGER, logging.INFO),
+)
+async def _upload_files_with_retry(sbx: daytona.AsyncSandbox, files: list[daytona.FileUpload]) -> None:
+    try:
+        await sbx.fs.upload_files(files=files)
+    except daytona.common.errors.DaytonaError as e:
+        _LOGGER.warning("Error uploading files to sandbox %s in state [%s]: %s", sbx.id, sbx.state, e)
+        raise
+
+
+@tenacity.retry(
+    retry=tenacity.retry_if_exception_type(daytona.common.errors.DaytonaError),
+    stop=tenacity.stop_after_attempt(5),
+    wait=tenacity.wait_exponential_jitter(max=60),
+    before_sleep=tenacity.before_sleep_log(_LOGGER, logging.INFO),
+)
+async def _download_files_with_retry(sbx: daytona.AsyncSandbox, files: list[daytona.FileDownloadRequest]) -> None:
+    try:
+        await sbx.fs.download_files(files=files)
+    except daytona.common.errors.DaytonaError as e:
+        _LOGGER.warning("Error downloading files from sandbox %s in state [%s]: %s", sbx.id, sbx.state, e)
+        raise
+
+
+@tenacity.retry(
+    retry=tenacity.retry_if_exception_type(daytona.common.errors.DaytonaError),
     stop=tenacity.stop_after_attempt(10),
     wait=tenacity.wait_exponential_jitter(max=60),
     before_sleep=tenacity.before_sleep_log(_LOGGER, logging.INFO),
@@ -67,6 +107,7 @@ async def _exec_with_retry(
 class DaytonaContainer(containers.Container):
     image: str | None = None
     dockerfile_path: pathlib.Path | str | None = None
+    snapshot_name: str | None = None
     name: str | None = None
     resources: containers.Resources | None = None
     default_workdir: str | None = None
@@ -85,7 +126,24 @@ class DaytonaContainer(containers.Container):
 
     async def start(self, env: dict[str, str] | None = None) -> None:
         """Start the container."""
-        # TODO: Look into using snapshots here - I believe it's way faster than images
+        if self.snapshot_name is not None:
+            _LOGGER.debug("Using snapshot: %s", self.snapshot_name)
+            if self._daytona_resources is not None:
+                _LOGGER.warning(
+                    "Resource overrides (cpu/memory/disk) are ignored when using snapshots — "
+                    "resources are baked into the snapshot at creation time."
+                )
+            params = daytona.CreateSandboxFromSnapshotParams(
+                name=self.name,
+                snapshot=self.snapshot_name,
+                env_vars=env,
+                auto_stop_interval=config.CONFIG.daytona_auto_stop_interval,
+                auto_delete_interval=0 if config.CONFIG.daytona_delete_on_stop else None,
+                labels={"user": config.CONFIG.user},
+            )
+            self._sbx = await _create_sandbox_from_snapshot_with_retry(params=params)
+            return
+
         if self.image is not None:
             _LOGGER.debug("Using prebuilt image: %s", self.image)
             img = daytona.Image.base(self.image)
@@ -93,7 +151,7 @@ class DaytonaContainer(containers.Container):
             _LOGGER.debug("Building environment from Dockerfile")
             img = daytona.Image.from_dockerfile(self.dockerfile_path)
         else:
-            raise ValueError("Must specify one of image or dockerfile_path")
+            raise ValueError("Must specify one of image, dockerfile_path, or snapshot_name")
 
         params = daytona.CreateSandboxFromImageParams(
             name=self.name,
@@ -192,7 +250,7 @@ class DaytonaContainer(containers.Container):
         ]
 
         if file_uploads:
-            await self._sbx.fs.upload_files(files=file_uploads)
+            await _upload_files_with_retry(self._sbx, file_uploads)
 
     async def download_files(self, remote_paths: list[str], local_paths: list[pathlib.Path]) -> None:
         """Download files from the container."""
@@ -208,7 +266,7 @@ class DaytonaContainer(containers.Container):
         ]
 
         if file_downloads:
-            await self._sbx.fs.download_files(files=file_downloads)
+            await _download_files_with_retry(self._sbx, file_downloads)
 
     @classmethod
     def from_image(
@@ -233,3 +291,13 @@ class DaytonaContainer(containers.Container):
         return DaytonaContainer(
             dockerfile_path=dockerfile_path, name=name, resources=resources, default_workdir=default_workdir
         )
+
+    @classmethod
+    def from_snapshot(
+        cls,
+        *,
+        snapshot_name: str,
+        name: str | None = None,
+        default_workdir: str | None = None,
+    ) -> "DaytonaContainer":
+        return DaytonaContainer(snapshot_name=snapshot_name, name=name, default_workdir=default_workdir)

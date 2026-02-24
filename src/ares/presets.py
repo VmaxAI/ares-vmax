@@ -65,6 +65,7 @@ class HarborSpec:
         selector: registry.TaskSelector,
         container_factory: containers.ContainerFactory,
         tracker: stat_tracker.StatTracker | None = None,
+        snapshot_template_name: str | None = None,
     ) -> base.Environment:
         """Create Harbor Verified environment with mini-swe-agent."""
         all_tasks = self.ds
@@ -79,6 +80,7 @@ class HarborSpec:
             code_agent_factory=self.code_agent_factory,
             step_limit=250,  # Same as mini-swe-agent default.
             tracker=tracker,
+            snapshot_template_name=snapshot_template_name,
         )
 
 

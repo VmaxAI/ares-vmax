@@ -14,6 +14,7 @@ import logging
 import pathlib
 import random
 import time
+import traceback
 from types import TracebackType
 from typing import Self
 
@@ -33,6 +34,10 @@ from ares.llms import request
 from ares.llms import response
 
 _LOGGER = logging.getLogger(__name__)
+
+# Retry config for reward computation (file uploads to sandbox can fail under load).
+_REWARD_MAX_RETRIES = 3
+_REWARD_BASE_DELAY = 5.0  # seconds
 
 
 @functools.lru_cache(maxsize=1)
@@ -67,6 +72,7 @@ class CodeEnvironment(base.Environment[response.LLMResponse, request.LLMRequest 
         step_limit: int = 250,  # Same as mini-swe-agent default.
         prefix: str = "harbor_env",
         tracker: stat_tracker.StatTracker | None = None,
+        snapshot_template_name: str | None = None,
     ):
         self._tasks = tasks
         self._container_factory = container_factory
@@ -74,6 +80,7 @@ class CodeEnvironment(base.Environment[response.LLMResponse, request.LLMRequest 
         self._step_limit = step_limit
         self._prefix = prefix
         self._tracker = tracker if tracker is not None else stat_tracker.NullStatTracker()
+        self._snapshot_template_name = snapshot_template_name
 
         # We set the LLM client to a queue mediated client so that
         # we can return LLM requests in the reset and step methods.
@@ -258,6 +265,8 @@ class CodeEnvironment(base.Environment[response.LLMResponse, request.LLMRequest 
                     memory=self._current_task.config.environment.memory_mb // 1024,
                     disk=self._current_task.config.environment.storage_mb // 1024,
                 ),
+                snapshot_template_name=self._snapshot_template_name,
+                task_name=self._current_task.name,
             )
             await self._container.start()
         _LOGGER.debug("[%d] Container setup complete.", id(self))
@@ -275,11 +284,55 @@ class CodeEnvironment(base.Environment[response.LLMResponse, request.LLMRequest 
         _LOGGER.debug("[%d] Code agent started.", id(self))
 
     async def _compute_reward(self) -> float:
-        """Run tests and compute the reward for the current episode."""
+        """Run tests and compute the reward, with retry for transient failures.
+
+        File uploads (tests dir) and downloads (reward file) can fail under
+        Daytona load (thundering herd when many sandboxes finish simultaneously).
+        Retries a few times with backoff; falls back to ``0.0`` on permanent
+        failure instead of crashing the episode.
+        """
         if self._container is None:
             raise RuntimeError("Container has not been created before computing reward.")
         if self._current_task is None:
             raise RuntimeError("Task has not been selected before computing reward.")
+
+        task_name = self._current_task.name
+        for attempt in range(1, _REWARD_MAX_RETRIES + 1):
+            try:
+                return await self._compute_reward_inner()
+            except Exception as e:
+                if attempt < _REWARD_MAX_RETRIES:
+                    delay = _REWARD_BASE_DELAY * attempt * (0.5 + random.random())
+                    _LOGGER.warning(
+                        "[%d] Reward computation failed for task %s (attempt %d/%d), retrying in %.1fs: %s: %s",
+                        id(self),
+                        task_name,
+                        attempt,
+                        _REWARD_MAX_RETRIES,
+                        delay,
+                        type(e).__name__,
+                        e,
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    _LOGGER.warning(
+                        "[%d] Reward computation failed for task %s after %d attempts, "
+                        "returning reward=0.0: %s: %s\n%s",
+                        id(self),
+                        task_name,
+                        _REWARD_MAX_RETRIES,
+                        type(e).__name__,
+                        e,
+                        traceback.format_exc(),
+                    )
+                    return 0.0
+
+        return 0.0  # Unreachable, but makes the type checker happy.
+
+    async def _compute_reward_inner(self) -> float:
+        """Run tests and compute the reward for the current episode."""
+        assert self._container is not None
+        assert self._current_task is not None
 
         _LOGGER.debug("[%d] Uploading tests to container.", id(self))
         await self._container.upload_dir(
@@ -295,7 +348,6 @@ class CodeEnvironment(base.Environment[response.LLMResponse, request.LLMRequest 
         test_path = str(
             pathlib.Path("/tests") / self._current_task.paths.test_path.relative_to(self._current_task.paths.tests_dir)
         )
-        # TODO: Log the output of the test execution somewhere that makes sense
         test_result = await self._container.exec_run(command=f"bash {test_path}")
         _LOGGER.debug("[%d] Test result: %s.", id(self), test_result.output)
 
@@ -312,7 +364,6 @@ class CodeEnvironment(base.Environment[response.LLMResponse, request.LLMRequest 
             except ValueError as e:
                 # Warn, but still try the other reward path
                 _LOGGER.warning("Error parsing reward file %s: %s", reward_path, e)
-                pass
 
         raise ValueError(f"[{id(self)}] No reward found for task {self._current_task.name}")
 

@@ -78,6 +78,10 @@ split-on-trailing-comma = false
 # Don't separate `from ... import ...` and `import ...` blocks.
 force-sort-within-sections = true
 
+[lint.per-file-ignores]
+# Prompt template contains long lines that must be kept verbatim.
+"src/ares/tinker_integration/terminal_env.py" = ["E501"]
+
 [lint.pydocstyle]
 convention = "google"
 # max-doc-length = 100
