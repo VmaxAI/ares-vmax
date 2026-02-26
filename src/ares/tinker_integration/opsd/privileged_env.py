@@ -21,11 +21,15 @@ from ares.tinker_integration import tinker_env
 _LOGGER = logging.getLogger(__name__)
 
 _PRIVILEGED_PREFIX = """\
-## Prior Analysis (from previous failed attempts)
+## Detailed Analysis of Previous Failed Attempts
+
+You have access to privileged information about this task from analyzing \
+previous failed attempts. Pay close attention to the specific files, error \
+patterns, anti-patterns to avoid, and recommended approach.
 
 {reflection}
 
-## Task (use the analysis above to guide your approach)
+## Task (apply the analysis above to solve it correctly)
 
 """
 
@@ -110,7 +114,12 @@ class PrivilegedAresCodeTinkerEnv:
             # We inject the reflection as a prefix to the rendered prompt.
             prefix_messages = [
                 {"role": "user", "content": _PRIVILEGED_PREFIX.format(reflection=self._reflection)},
-                {"role": "assistant", "content": "Understood, I will use this analysis to guide my approach."},
+                {
+                    "role": "assistant",
+                    "content": "I have carefully reviewed the analysis of previous failed attempts. "
+                    "I understand the error patterns, root causes, key files involved, and the "
+                    "recommended approach. I will apply these insights to solve the task correctly.",
+                },
             ]
             prefix_input = self._inner._renderer.build_generation_prompt(prefix_messages)
             prefix_tokens = prefix_input.to_ints()

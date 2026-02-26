@@ -20,20 +20,32 @@ from ares.tinker_integration.opsd import evaluation as eval_mod
 _LOGGER = logging.getLogger(__name__)
 
 _REFLECTION_PROMPT_TEMPLATE = """\
-You are analyzing failed attempts to solve a software engineering task.
+You are analyzing failed attempts to solve a software engineering task. Your \
+analysis will be used as privileged information to guide a future attempt, so \
+be thorough and specific — include exact file paths, function names, error \
+messages, and concrete steps.
 
 ## Task
 {task_instruction}
 
 {trace_sections}
 
-Analyze what went wrong and provide:
-1. Key error patterns and tracebacks observed
-2. Root cause analysis of the failures
-3. Specific hints for solving this task
-4. A recommended approach that avoids the observed failures
+Provide a detailed analysis covering:
+1. **Error patterns**: Exact error messages, tracebacks, and assertion \
+failures observed across attempts.
+2. **Root cause analysis**: Why each attempt failed — wrong file edited, \
+incorrect fix logic, missing edge case, wrong test interpretation, etc.
+3. **Key files and locations**: Specific files, classes, functions, and \
+line numbers that are relevant to the fix.
+4. **What NOT to do**: Anti-patterns observed in the failed attempts that \
+should be avoided.
+5. **Recommended approach**: A concrete step-by-step plan to solve this \
+task, including which files to modify, what changes to make, and how to \
+verify the fix.
+6. **Test expectations**: What the test suite expects and any subtleties \
+in the test assertions.
 
-Be concise and actionable (under 500 words)."""
+Be thorough. Detail is more important than brevity."""
 
 _TRACE_SECTION_TEMPLATE = """\
 ## Failed Attempt {attempt_num}
@@ -62,9 +74,15 @@ def _extract_condensed_trace(
         except Exception:
             return "(unable to extract trace)"
 
-    # Take the last few transitions for the most relevant context.
-    last_transitions = transitions[-3:]
+    # Take the last several transitions for richer context.  We include more
+    # turns than strictly necessary because error patterns often span multiple
+    # steps (e.g. the model edits a file, runs tests, sees an error, tries a
+    # different fix, sees a different error).
+    last_transitions = transitions[-6:]
     parts: list[str] = []
+
+    # Budget per transition: split max_tokens across all transitions.
+    per_transition_tokens = max(max_tokens // max(len(last_transitions), 1), 512)
 
     for t in last_transitions:
         # Each transition has observation (model_input) and action (token list).
@@ -77,7 +95,7 @@ def _extract_condensed_trace(
             try:
                 obs_tokens = obs.to_ints() if hasattr(obs, "to_ints") else []
                 if obs_tokens:
-                    obs_text = tokenizer.decode(obs_tokens[-max_tokens // 2 :])
+                    obs_text = tokenizer.decode(obs_tokens[-per_transition_tokens:])
             except Exception:
                 pass
 
@@ -124,11 +142,11 @@ def _extract_task_instruction(task_result: eval_mod.TaskEvalResult, tokenizer: A
     try:
         obs_tokens = first_obs.to_ints() if hasattr(first_obs, "to_ints") else []
         if obs_tokens:
-            # Take the first portion as the task instruction.
-            text = tokenizer.decode(obs_tokens[:2048])
-            # Truncate to reasonable length.
-            if len(text) > 2000:
-                text = text[:2000] + "..."
+            # Take a generous portion as the task instruction — the full problem
+            # statement is critical for high-quality reflection.
+            text = tokenizer.decode(obs_tokens[:4096])
+            if len(text) > 8000:
+                text = text[:8000] + "..."
             return text
     except Exception:
         pass

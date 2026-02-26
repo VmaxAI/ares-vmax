@@ -1,6 +1,6 @@
 # OPSD Recipe (On-Policy Self-Distillation)
 
-Iterative phasic training where the model learns from its own failures through self-reflection and knowledge distillation.
+The model learns from its own failures through self-reflection and knowledge distillation.
 
 ## Quick Start
 
@@ -15,10 +15,11 @@ uv run python examples/07_tinker_opsd_train.py \
     --log-path ./runs/opsd_sbv_mswea \
     --env daytona \
     --snapshot-template "ares__{name}" \
-    --max-steps-off-policy 3 \
-    --num-iterations 3 \
-    --rl-batches-per-iteration 10 \
-    --distill-batches 5 \
+    --num-batches 200 \
+    --groups-per-batch 32 \
+    --group-size 8 \
+    --opsd-every 1 \
+    --num-distillation-steps 5 \
     --distill-kl-penalty-coef 1.0 \
     --wandb-project ares-tinker-opsd
 
@@ -30,29 +31,29 @@ uv run python examples/07_tinker_opsd_train.py \
     --renderer-name qwen3 \
     --log-path ./runs/opsd_smoke \
     --env docker \
-    --num-iterations 1 \
-    --rl-batches-per-iteration 1 \
-    --distill-batches 1
+    --num-batches 2 \
+    --num-distillation-steps 1
 ```
 
 ## How It Works
 
-Each OPSD iteration runs these phases:
+The main loop runs `num_batches` RL batches. Every `opsd_every` batches, the OPSD phases trigger:
 
 ```
-ITERATION 1
-├── Phase 1: Student RL (10 batches of standard RL)
-├── Phase 2: Evaluate student on ALL 50 tasks (6 rollouts each)
-│   └── Identify hard tasks (0% success across all 6 rollouts)
-├── Phase 3: Self-reflection (pure LLM call per hard task)
-│   └── Extract condensed traces → generate compact hints
-├── Phase 4: Teacher re-attempts hard tasks (same model + reflections)
-│   └── Identify tasks teacher solved but student couldn't
-├── Phase 5: On-policy distillation (reverse KL from teacher)
-│   └── Student generates on-policy, teacher logprobs via token prepending
-│
-ITERATION 2 (repeat with updated model weights)
-├── ...
+for batch in range(num_batches):              # e.g., 200
+    rl_batch(groups_per_batch × group_size)    # 32×8 = 256 rollouts
+
+    if (batch + 1) % opsd_every == 0:         # default: every batch
+        1. Evaluate student on ALL tasks (eval_group_size rollouts each)
+           └── Identify hard tasks (0% success)
+        2. Self-reflect on failed traces (pure LLM call per hard task)
+           └── Extract condensed traces → generate compact hints
+        3. Teacher re-attempts hard tasks (same model + reflections)
+           └── teacher_group_size rollouts each
+        4. Filter: keep tasks teacher solved but student couldn't
+        5. Distill: num_distillation_steps gradient steps
+           └── Each step: student rollouts on ALL distillable tasks
+               (same group_size as RL), compute teacher KL, train
 ```
 
 ### Key Insight
@@ -78,7 +79,7 @@ This is added as a negative advantage to encourage the student to match the teac
 opsd/
 ├── __init__.py
 ├── config.py              OPSDConfig — extends TrainingConfig with OPSD-specific fields
-├── train.py               run_opsd_training() — iterative phasic orchestrator
+├── train.py               run_opsd_training() — main loop + OPSD phase orchestration
 ├── evaluation.py          Student/teacher evaluation: run rollouts, identify hard tasks
 ├── reflection.py          Self-reflection: extract failure traces, generate hints via LLM
 ├── privileged_env.py      Env wrappers that inject reflection text as privileged context
@@ -109,22 +110,20 @@ All flags from the [shared CLI reference](../README.md#shared-cli-reference) app
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--num-iterations` | `3` | Number of OPSD iterations |
-| `--rl-batches-per-iteration` | `10` | RL batches per iteration |
-| `--eval-group-size` | `6` | Rollouts per task during evaluation |
-| `--teacher-group-size` | `6` | Rollouts per task for teacher re-attempt |
-| `--max-reflection-tokens` | `1024` | Max tokens for generated reflection |
-| `--max-condensed-trace-tokens` | `2048` | Max tokens per condensed failure trace |
-| `--num-traces-for-reflection` | `2` | Failed traces used per reflection |
-| `--distill-batches` | `5` | Distillation batches per iteration |
-| `--distill-groups-per-batch` | `10` | Task groups per distillation batch |
-| `--distill-group-size` | `4` | Rollouts per distillation group |
+| `--opsd-every` | `1` | Run OPSD phases every N RL batches |
+| `--eval-group-size` | `16` | Rollouts per task during evaluation |
+| `--teacher-group-size` | `16` | Rollouts per task for teacher re-attempt |
+| `--max-reflection-tokens` | `4096` | Max tokens for generated reflection |
+| `--max-condensed-trace-tokens` | `4096` | Max tokens per condensed failure trace |
+| `--num-traces-for-reflection` | `4` | Failed traces used per reflection |
+| `--num-distillation-steps` | `5` | Gradient steps per OPSD cycle on distillable tasks |
 | `--distill-kl-penalty-coef` | `1.0` | Reverse KL penalty coefficient |
 | `--distill-kl-discount-factor` | `0.0` | Discount factor for KL penalty |
 
 Key defaults:
 - `--harness code-agent` (code-agent is the default for OPSD)
 - `--wandb-project ares-tinker-opsd`
+- Distillation uses the same `--group-size` as RL (no separate distill group size)
 
 ## Logging
 
@@ -144,19 +143,18 @@ opsd/task/{task_name}/teacher_solved
 
 # Phase tracking
 opsd/phase: "rl" | "eval" | "reflection" | "teacher" | "distill"
-opsd/iteration: 0, 1, 2, ...
 ```
 
 ## Checkpoint & Resume
 
-OPSD saves iteration state to `{log_path}/opsd_state.json` after each phase.
+OPSD saves state to `{log_path}/opsd_state.json` after each phase.
 Tinker checkpoints are saved via `save_checkpoint_async` at regular intervals.
 
 ## Edge Cases
 
-1. **No hard tasks**: All tasks solved in evaluation. Skip OPSD phases, continue to next iteration.
+1. **No hard tasks**: All tasks solved in evaluation. Skip OPSD phases.
 2. **All tasks hard**: None solved. Still run reflection + teacher — the teacher might solve some with hints.
 3. **Teacher can't solve any**: Skip distillation. Log warning.
 4. **Context overflow during teacher logprobs**: Skip individual datums where `len(priv_tokens) + len(student_tokens) > max_trajectory_tokens`. Count logged in `opsd/distill/num_skipped_long`.
 5. **Sandbox failures**: Reuse existing retry logic (monkey-patched). Failed tasks excluded from results.
-6. **Empty distillation batch**: All trajectory groups None. Skip train step (no weight update).
+6. **Empty distillation step**: All trajectory groups None. Skip train step (no weight update).

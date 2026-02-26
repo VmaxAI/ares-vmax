@@ -19,8 +19,21 @@ from ares.tinker_integration.opsd import config as opsd_config_mod
 
 _LOGGER = logging.getLogger(__name__)
 
-_PRIVILEGED_CONTEXT_TEMPLATE = "Prior analysis from previous failed attempts:\n{reflection}"
-_PRIVILEGED_ACK = "Understood, I will use this analysis to guide my approach."
+_PRIVILEGED_CONTEXT_TEMPLATE = """\
+You have access to a detailed analysis of previous failed attempts at this task. \
+Use this privileged information to guide your approach — pay close attention to \
+the specific files, error patterns, and recommended steps.
+
+## Analysis of Previous Failed Attempts
+{reflection}
+
+Apply these insights directly. Avoid the anti-patterns identified above and \
+follow the recommended approach."""
+
+_PRIVILEGED_ACK = """\
+I have carefully reviewed the analysis of previous failed attempts. I understand \
+the error patterns, root causes, key files involved, and the recommended approach. \
+I will apply these insights to solve the task correctly."""
 
 
 async def compute_teacher_logprobs_for_datum(

@@ -1,8 +1,8 @@
 """ARES + Tinker OPSD Training (On-Policy Self-Distillation).
 
-Iterative phasic training: student RL, hard-task identification, self-reflection,
-teacher re-attempt, and reverse-KL distillation from a context-enriched teacher
-(same model weights + privileged information).
+Runs ``num_batches`` RL batches with OPSD phases (eval, self-reflection,
+teacher re-attempt, reverse-KL distillation) triggered every ``opsd_every``
+batches.
 
 Supports both harness modes:
 - ``--harness terminal``: Direct tmux terminal control via JSON commands.
@@ -24,26 +24,15 @@ Usage:
         --log-path ./runs/opsd_sbv_mswea \\
         --env daytona \\
         --snapshot-template "ares__{name}" \\
-        --max-steps-off-policy 3 \\
-        --num-iterations 3 \\
-        --rl-batches-per-iteration 10 \\
-        --distill-batches 5 \\
+        --num-batches 200 \\
+        --groups-per-batch 32 \\
+        --group-size 8 \\
+        --opsd-every 1 \\
+        --num-distillation-steps 5 \\
         --distill-kl-penalty-coef 1.0 \\
-        --wandb-project ares-tinker-opsd \\
-        --wandb-name "opsd-sbv-mswea-code-agent"
+        --wandb-project ares-tinker-opsd
 
-    # Terminal harness — multi-task from ARES preset
-    uv run python examples/07_tinker_opsd_train.py \\
-        --harness terminal \\
-        --preset tbench-terminus2 \\
-        --num-tasks 20 \\
-        --model-name Qwen/Qwen3-30B-A3B-Instruct-2507 \\
-        --renderer-name qwen3 \\
-        --log-path ./runs/opsd_tbench \\
-        --env daytona \\
-        --num-iterations 3
-
-    # Minimal smoke test (Docker, few tasks, 1 iteration)
+    # Minimal smoke test
     uv run python examples/07_tinker_opsd_train.py \\
         --preset sbv-mswea \\
         --num-tasks 5 \\
@@ -51,9 +40,8 @@ Usage:
         --renderer-name qwen3 \\
         --log-path ./runs/opsd_smoke \\
         --env docker \\
-        --num-iterations 1 \\
-        --rl-batches-per-iteration 1 \\
-        --distill-batches 1
+        --num-batches 2 \\
+        --num-distillation-steps 1
 """
 
 from __future__ import annotations
@@ -95,43 +83,42 @@ def parse_args() -> opsd_config_mod.OPSDConfig:
     p.add_argument("--model-name", type=str, required=True, help="HuggingFace model ID")
     p.add_argument("--renderer-name", type=str, default=None, help="Renderer name (auto-detected if None)")
 
-    # Base training hyperparameters (for RL phase)
+    # Training hyperparameters (shared between RL and distillation)
     p.add_argument("--learning-rate", type=float, default=4e-5, help="Learning rate")
     p.add_argument("--lora-rank", type=int, default=32, help="LoRA rank")
     p.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature")
-    p.add_argument("--max-tokens", type=int, default=4096, help="Max generation tokens")
-    p.add_argument("--group-size", type=int, default=4, help="RL rollouts per task group")
-    p.add_argument("--groups-per-batch", type=int, default=10, help="RL task groups per batch")
-    p.add_argument("--num-batches", type=int, default=100, help="Total RL batches (across all iterations)")
+    p.add_argument("--max-tokens", type=int, default=4096, help="Max generation tokens per turn")
+    p.add_argument("--group-size", type=int, default=8, help="Rollouts per task group (RL and distillation)")
+    p.add_argument("--groups-per-batch", type=int, default=32, help="Task groups per RL batch")
+    p.add_argument("--num-batches", type=int, default=200, help="Total RL batches")
     p.add_argument("--max-trajectory-tokens", type=int, default=32768, help="Max context tokens")
 
-    # Loss and training options
+    # Loss and optimization
     p.add_argument("--loss-fn", type=str, default="importance_sampling", help="Loss function")
     p.add_argument("--remove-constant-reward-groups", action="store_true", help="Filter constant reward groups")
     p.add_argument("--grad-clip-norm", type=float, default=0.5, help="Gradient clipping norm")
     p.add_argument("--kl-penalty-coef", type=float, default=0.0, help="RL KL penalty coefficient")
 
-    # OPSD iteration control
-    p.add_argument("--num-iterations", type=int, default=3, help="Number of OPSD iterations")
-    p.add_argument("--rl-batches-per-iteration", type=int, default=10, help="RL batches per OPSD iteration")
+    # OPSD scheduling
+    p.add_argument("--opsd-every", type=int, default=1, help="Run OPSD phases every N RL batches")
 
     # Evaluation phase
-    p.add_argument("--eval-group-size", type=int, default=6, help="Rollouts per task during evaluation")
+    p.add_argument("--eval-group-size", type=int, default=16, help="Rollouts per task during evaluation")
 
     # Teacher phase
-    p.add_argument("--teacher-group-size", type=int, default=6, help="Rollouts per task for teacher re-attempt")
+    p.add_argument("--teacher-group-size", type=int, default=16, help="Rollouts per task for teacher re-attempt")
 
     # Reflection phase
-    p.add_argument("--max-reflection-tokens", type=int, default=1024, help="Max tokens for reflection generation")
-    p.add_argument("--max-condensed-trace-tokens", type=int, default=2048, help="Max tokens per condensed trace")
-    p.add_argument("--num-traces-for-reflection", type=int, default=2, help="Failed traces per task for reflection")
+    p.add_argument("--max-reflection-tokens", type=int, default=4096, help="Max tokens for reflection generation")
+    p.add_argument("--max-condensed-trace-tokens", type=int, default=4096, help="Max tokens per condensed trace")
+    p.add_argument("--num-traces-for-reflection", type=int, default=4, help="Failed traces per task for reflection")
 
     # Distillation phase
-    p.add_argument("--distill-batches", type=int, default=5, help="Distillation batches per iteration")
-    p.add_argument("--distill-groups-per-batch", type=int, default=10, help="Task groups per distillation batch")
-    p.add_argument("--distill-group-size", type=int, default=4, help="Rollouts per distillation task group")
-    p.add_argument("--distill-kl-penalty-coef", type=float, default=1.0, help="KL penalty for distillation")
-    p.add_argument("--distill-kl-discount-factor", type=float, default=0.0, help="Discount factor for KL")
+    p.add_argument(
+        "--num-distillation-steps", type=int, default=5, help="Gradient steps per OPSD cycle on distillable tasks"
+    )
+    p.add_argument("--distill-kl-penalty-coef", type=float, default=1.0, help="Reverse KL penalty coefficient")
+    p.add_argument("--distill-kl-discount-factor", type=float, default=0.0, help="Discount factor for KL penalty")
 
     # Sandbox safety and resources
     p.add_argument("--auto-stop-minutes", type=int, default=30, help="Auto-stop idle sandboxes after N minutes")
@@ -210,16 +197,13 @@ def parse_args() -> opsd_config_mod.OPSDConfig:
         base_url=args.base_url,
         load_checkpoint_path=args.load_checkpoint_path,
         # OPSD-specific fields
-        num_iterations=args.num_iterations,
-        rl_batches_per_iteration=args.rl_batches_per_iteration,
+        opsd_every=args.opsd_every,
         eval_group_size=args.eval_group_size,
         teacher_group_size=args.teacher_group_size,
         max_reflection_tokens=args.max_reflection_tokens,
         max_condensed_trace_tokens=args.max_condensed_trace_tokens,
         num_traces_for_reflection=args.num_traces_for_reflection,
-        distill_batches=args.distill_batches,
-        distill_groups_per_batch=args.distill_groups_per_batch,
-        distill_group_size=args.distill_group_size,
+        num_distillation_steps=args.num_distillation_steps,
         distill_kl_penalty_coef=args.distill_kl_penalty_coef,
         distill_kl_discount_factor=args.distill_kl_discount_factor,
     )
