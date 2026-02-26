@@ -237,6 +237,76 @@ async def _run_distillation_steps(
         config.group_size,
     )
 
+    # --- Single rollout: student generates on-policy once ---
+    t_rollout = time.time()
+    builders = [builder_factory(task, config.group_size) for task in distill_tasks]
+
+    do_rollout = tinker_train.do_group_rollout_and_filter_constant_reward
+    trajectory_groups = await asyncio.gather(
+        *[
+            asyncio.create_task(
+                do_rollout(
+                    sampling_client,
+                    builder,
+                    temperature=config.temperature,
+                    max_tokens=config.max_tokens,
+                    do_remove_constant_reward_groups=False,
+                ),
+                name=f"distill_rollout_{i}",
+            )
+            for i, builder in enumerate(builders)
+        ],
+    )
+
+    # Filter None groups.
+    valid_triples = [
+        (b, tg, name)
+        for b, tg, name in zip(builders, trajectory_groups, distill_task_names, strict=True)
+        if tg is not None
+    ]
+    if not valid_triples:
+        _LOGGER.warning("DISTILL | all rollouts failed, skipping distillation")
+        return sampling_client, global_batch
+
+    valid_builders = [t[0] for t in valid_triples]
+    valid_trajectory_groups = [t[1] for t in valid_triples]
+    valid_task_names = [t[2] for t in valid_triples]
+
+    # Compute advantages and assemble training data (once).
+    taglist = [b.logging_tags() for b in valid_builders]
+    traj_metrics = importlib.import_module("tinker_cookbook.rl.metric_util").compute_trajectory_metrics(
+        valid_trajectory_groups, taglist
+    )
+
+    advantages = rl_data.compute_advantages(valid_trajectory_groups)
+    data_d, metadata_d = rl_data.assemble_training_data(valid_trajectory_groups, advantages)
+
+    if not data_d:
+        _LOGGER.warning("DISTILL | no training data after assembly, skipping")
+        return sampling_client, global_batch
+
+    # Map each datum to its task name.
+    task_names_for_data = [valid_task_names[m["group_idx"]] for m in metadata_d]
+
+    # Compute teacher KL penalty (once — same on-policy data, same reflections).
+    kl_metrics = await distillation.incorporate_teacher_kl(
+        data_d,
+        reflections,
+        task_names_for_data,
+        sampling_client,
+        renderer,
+        config,
+    )
+
+    rollout_time = time.time() - t_rollout
+    _LOGGER.info(
+        "DISTILL | rollout done | valid_groups=%d | datums=%d | rollout_time=%.1fs",
+        len(valid_triples),
+        len(data_d),
+        rollout_time,
+    )
+
+    # --- Multiple gradient steps on the same on-policy data ---
     for step_idx in range(config.num_distillation_steps):
         t_start = time.time()
         metrics: dict[str, Any] = {
@@ -244,76 +314,13 @@ async def _run_distillation_steps(
             "opsd/phase": "distill",
             "opsd/distill_step": step_idx,
             "opsd/distill_num_tasks": len(distill_tasks),
+            "opsd/distill/num_valid_groups": len(valid_triples),
+            "opsd/distill/num_datums": len(data_d),
         }
-
-        # Build one group per distillable task, using the same group_size as RL.
-        builders = [builder_factory(task, config.group_size) for task in distill_tasks]
-
-        # Run student rollouts (standard, non-privileged).
-        do_rollout = tinker_train.do_group_rollout_and_filter_constant_reward
-        trajectory_groups = await asyncio.gather(
-            *[
-                asyncio.create_task(
-                    do_rollout(
-                        sampling_client,
-                        builder,
-                        temperature=config.temperature,
-                        max_tokens=config.max_tokens,
-                        do_remove_constant_reward_groups=False,
-                    ),
-                    name=f"distill_rollout_{i}",
-                )
-                for i, builder in enumerate(builders)
-            ],
-        )
-
-        # Filter None groups.
-        valid_triples = [
-            (b, tg, name)
-            for b, tg, name in zip(builders, trajectory_groups, distill_task_names, strict=True)
-            if tg is not None
-        ]
-        if not valid_triples:
-            _LOGGER.warning("DISTILL | step %d | all rollouts failed, skipping", step_idx)
-            global_batch += 1
-            continue
-
-        valid_builders = [t[0] for t in valid_triples]
-        valid_trajectory_groups = [t[1] for t in valid_triples]
-        valid_task_names = [t[2] for t in valid_triples]
-
-        metrics["opsd/distill/num_valid_groups"] = len(valid_triples)
-
-        # Compute advantages and assemble training data.
-        taglist = [b.logging_tags() for b in valid_builders]
-        traj_metrics = importlib.import_module("tinker_cookbook.rl.metric_util").compute_trajectory_metrics(
-            valid_trajectory_groups, taglist
-        )
         metrics.update(traj_metrics)
-
-        advantages = rl_data.compute_advantages(valid_trajectory_groups)
-        data_d, metadata_d = rl_data.assemble_training_data(valid_trajectory_groups, advantages)
-
-        if not data_d:
-            _LOGGER.warning("DISTILL | step %d | no training data, skipping", step_idx)
-            global_batch += 1
-            continue
-
-        # Map each datum to its task name using metadata.
-        task_names_for_data = [valid_task_names[m["group_idx"]] for m in metadata_d]
-
-        # Incorporate teacher KL penalty.
-        kl_metrics = await distillation.incorporate_teacher_kl(
-            data_d,
-            reflections,
-            task_names_for_data,
-            sampling_client,
-            renderer,
-            config,
-        )
         metrics.update(kl_metrics)
 
-        # Train step.
+        # Train step on the same data.
         sampling_client = await tinker_train.train_step(
             training_client=training_client,
             data_D=data_d,
@@ -322,6 +329,8 @@ async def _run_distillation_steps(
         )
 
         metrics["time/total"] = time.time() - t_start
+        if step_idx == 0:
+            metrics["time/rollout"] = rollout_time
         ml_logger.log_metrics(metrics, step=global_batch)
 
         # Save checkpoint periodically.
