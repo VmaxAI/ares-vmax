@@ -1,25 +1,17 @@
-"""ARES + Tinker RL integration.
+"""ARES + Tinker training integration.
 
-This module provides two harness modes for training code agents with Tinker's RL
-infrastructure:
+Provides two training recipes and two harness modes:
 
-**Terminal harness** (``harness="terminal"``, default):
-    Direct tmux terminal control via JSON commands. The model gets raw terminal
-    access, producing a clean RL learning signal.
+**Recipes:**
+- ``rl``: Standard RL training (GRPO-style, sync or async).
+- ``opsd``: On-Policy Self-Distillation — iterative phasic training with
+  self-reflection and reverse-KL distillation from a context-enriched teacher.
 
-**Code-agent harness** (``harness="code-agent"``):
-    ARES CodeEnvironment with any agent harness (Mini-SWE-Agent, Terminus2, etc.).
-    LLM calls are intercepted via QueueMediatedLLMClient and exposed as RL observations.
+**Harness modes** (shared by both recipes):
+- ``terminal``: Direct tmux terminal control via JSON commands.
+- ``code-agent``: ARES CodeEnvironment with any agent harness (Mini-SWE-Agent, etc.).
 
-Both share the same training infrastructure (monkey-patches, config, dataset batching).
-
-Key components:
-- AsyncTerminalGymEnv: Gym-like wrapper over Harbor environments with tmux terminal control
-- HarborTerminalTinkerEnv: Tinker Env adapter with JSON command parsing (terminal harness)
-- AresCodeTinkerEnv: Tinker Env adapter wrapping ARES CodeEnvironment (code-agent harness)
-- TerminalRLDataset / TerminalRLDatasetBuilder: Multi-task dataset layer (terminal harness)
-- AresEnvGroupBuilder / AresRLDatasetBuilder: Multi-task dataset layer (code-agent harness)
-- run_training: Training entry point (auto-selects harness based on config)
+Shared infrastructure: monkey-patches, config, dataset batching, env adapters.
 """
 
 from ares.tinker_integration.ares_env import AresCodeTinkerEnv
@@ -32,9 +24,10 @@ from ares.tinker_integration.dataset import TerminalRLDataset
 from ares.tinker_integration.dataset import TerminalRLDatasetBuilder
 from ares.tinker_integration.dataset import load_tasks_from_preset
 from ares.tinker_integration.dataset import load_tasks_from_task_dir
+from ares.tinker_integration.monkey_patches import MonkeyPatchContext
+from ares.tinker_integration.rl.train import run_training
 from ares.tinker_integration.terminal_env import AsyncTerminalGymEnv
 from ares.tinker_integration.tinker_env import HarborTerminalTinkerEnv
-from ares.tinker_integration.train import run_training
 
 __all__ = [
     "AresCodeTinkerEnv",
@@ -42,6 +35,7 @@ __all__ = [
     "AresRLDatasetBuilder",
     "AsyncTerminalGymEnv",
     "HarborTerminalTinkerEnv",
+    "MonkeyPatchContext",
     "TerminalEnvGroupBuilder",
     "TerminalRLDataset",
     "TerminalRLDatasetBuilder",
