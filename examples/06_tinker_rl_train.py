@@ -96,9 +96,9 @@ def parse_args() -> config_mod.TrainingConfig:
     p.add_argument("--lora-rank", type=int, default=32, help="LoRA rank")
     p.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature")
     p.add_argument("--max-tokens", type=int, default=4096, help="Max generation tokens")
-    p.add_argument("--group-size", type=int, default=4, help="Rollouts per task")
-    p.add_argument("--groups-per-batch", type=int, default=10, help="Task groups per batch")
-    p.add_argument("--num-batches", type=int, default=15, help="Number of training batches")
+    p.add_argument("--group-size", type=int, default=8, help="Rollouts per task")
+    p.add_argument("--groups-per-batch", type=int, default=32, help="Task groups per batch")
+    p.add_argument("--num-batches", type=int, default=200, help="Number of training batches")
     p.add_argument("--max-trajectory-tokens", type=int, default=32768, help="Max context tokens")
 
     # Loss and training options

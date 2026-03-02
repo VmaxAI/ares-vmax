@@ -95,7 +95,7 @@ Both recipes apply the same set of monkey-patches via `MonkeyPatchContext`:
 | `--sandbox-memory-gb` | task default | RAM (GB) per sandbox |
 | `--sandbox-disk-gb` | task default | Disk (GB) per sandbox |
 | `--snapshot-template` | none | Snapshot template with `{name}` placeholder |
-| `--max-concurrent-sandboxes` | `20` | Cap concurrent sandbox creations (0 = no limit) |
+| `--max-concurrent-sandboxes` | `0` | Cap concurrent sandbox creations (0 = no limit) |
 
 ### Model
 

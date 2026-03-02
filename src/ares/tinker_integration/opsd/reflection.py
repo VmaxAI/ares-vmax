@@ -14,38 +14,74 @@ import asyncio
 import logging
 from typing import Any
 
+import tinker
+
 from ares.tinker_integration.opsd import config as opsd_config_mod
 from ares.tinker_integration.opsd import evaluation as eval_mod
 
 _LOGGER = logging.getLogger(__name__)
 
 _REFLECTION_PROMPT_TEMPLATE = """\
-You are analyzing failed attempts to solve a software engineering task. Your \
-analysis will be used as privileged information to guide a future attempt, so \
-be thorough and specific — include exact file paths, function names, error \
-messages, and concrete steps.
+You are an expert software engineer analyzing failed attempts to solve a \
+software engineering task. Your analysis will be injected as privileged \
+information into a future attempt by the same model, so be maximally \
+thorough — the more detail you provide, the higher the chance of success.
 
-## Task
+## Task Description
 {task_instruction}
 
+## Failed Attempts
 {trace_sections}
 
-Provide a detailed analysis covering:
-1. **Error patterns**: Exact error messages, tracebacks, and assertion \
-failures observed across attempts.
-2. **Root cause analysis**: Why each attempt failed — wrong file edited, \
-incorrect fix logic, missing edge case, wrong test interpretation, etc.
-3. **Key files and locations**: Specific files, classes, functions, and \
-line numbers that are relevant to the fix.
-4. **What NOT to do**: Anti-patterns observed in the failed attempts that \
-should be avoided.
-5. **Recommended approach**: A concrete step-by-step plan to solve this \
-task, including which files to modify, what changes to make, and how to \
-verify the fix.
-6. **Test expectations**: What the test suite expects and any subtleties \
-in the test assertions.
+Write an extremely detailed analysis. Cover EVERY section below thoroughly. \
+Do NOT abbreviate — length and specificity are critical.
 
-Be thorough. Detail is more important than brevity."""
+### 1. Problem Distillation
+Restate the core problem in your own words. What exactly needs to change? \
+What is the expected behavior vs. the current behavior? What edge cases or \
+subtleties make this problem non-trivial?
+
+### 2. Codebase Context
+Which repository is this? What framework/library version? What are the \
+relevant source files, classes, methods, and line numbers? Describe the \
+architecture around the code that needs to change — how do the relevant \
+components interact?
+
+### 3. Per-Attempt Failure Analysis
+For EACH failed attempt above, explain in detail:
+- What approach did the model take?
+- What specific commands were run and what was the output?
+- What exact error messages, tracebacks, or assertion failures occurred?
+- WHY did this approach fail? (wrong file, wrong logic, missed edge case, \
+misunderstood the test, etc.)
+- What partial progress was made that could be built upon?
+
+### 4. Error Patterns and Root Causes
+Synthesize across all attempts:
+- What common mistakes keep recurring?
+- What is the fundamental root cause of failure?
+- Are there red herrings or misleading paths in the codebase?
+
+### 5. Critical Anti-Patterns (What NOT To Do)
+List specific approaches, files, or strategies that were tried and failed. \
+Be explicit about why each should be avoided.
+
+### 6. Recommended Solution
+Provide a concrete, step-by-step implementation plan:
+- Which file(s) to modify and in what order
+- What exact changes to make (describe the code changes precisely)
+- How to handle edge cases identified above
+- How to verify the fix works (which test commands to run)
+
+### 7. Test Suite Analysis
+- What tests are being run and what do they assert?
+- Are there subtleties in the test expectations (e.g., exact string \
+matching, specific exception types, ordering requirements)?
+- What would a passing test output look like?
+
+Be exhaustive. Write as much as you can. Every specific detail you include \
+(file paths, function names, error messages, line numbers) directly \
+increases the probability of success on the next attempt."""
 
 _TRACE_SECTION_TEMPLATE = """\
 ## Failed Attempt {attempt_num}
@@ -85,12 +121,12 @@ def _extract_condensed_trace(
     per_transition_tokens = max(max_tokens // max(len(last_transitions), 1), 512)
 
     for t in last_transitions:
-        # Each transition has observation (model_input) and action (token list).
+        # Transition fields: ob (ModelInput), ac (TokensWithLogprobs).
         obs_text = ""
         action_text = ""
 
-        # Try to decode observation.
-        obs = getattr(t, "observation", None)
+        # Decode observation (ModelInput with .to_ints()).
+        obs = getattr(t, "ob", None)
         if obs is not None:
             try:
                 obs_tokens = obs.to_ints() if hasattr(obs, "to_ints") else []
@@ -99,12 +135,13 @@ def _extract_condensed_trace(
             except Exception:
                 pass
 
-        # Try to decode action.
-        action = getattr(t, "action", None)
+        # Decode action (TokensWithLogprobs with .tokens list).
+        action = getattr(t, "ac", None)
         if action is not None:
             try:
-                if isinstance(action, list):
-                    action_text = tokenizer.decode(action)
+                action_tokens = getattr(action, "tokens", None)
+                if action_tokens:
+                    action_text = tokenizer.decode(action_tokens)
                 elif hasattr(action, "to_ints"):
                     action_text = tokenizer.decode(action.to_ints())
             except Exception:
@@ -135,7 +172,7 @@ def _extract_task_instruction(task_result: eval_mod.TaskEvalResult, tokenizer: A
         return f"Task: {task_result.task_name}"
 
     # The first observation typically contains the task instruction.
-    first_obs = getattr(transitions[0], "observation", None)
+    first_obs = getattr(transitions[0], "ob", None)
     if first_obs is None:
         return f"Task: {task_result.task_name}"
 
@@ -197,14 +234,18 @@ async def _generate_single_reflection(
     model_input = renderer.build_generation_prompt(messages)
 
     try:
-        result = await sampling_client.sample_async(
-            model_input,
+        sampling_params = tinker.SamplingParams(
             max_tokens=config.max_reflection_tokens,
             temperature=0.7,
         )
+        result = await sampling_client.sample_async(
+            model_input,
+            num_samples=1,
+            sampling_params=sampling_params,
+        )
 
-        # Decode the generated tokens.
-        response_tokens = result.tokens if hasattr(result, "tokens") else []
+        # Decode the generated tokens from the first (only) sequence.
+        response_tokens = result.sequences[0].tokens if result.sequences else []
         reflection_text = tokenizer.decode(response_tokens) if response_tokens else str(result)
 
         _LOGGER.info(
