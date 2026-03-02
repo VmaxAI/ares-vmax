@@ -2,7 +2,8 @@
 
 Runs ``num_batches`` RL batches.  Every ``opsd_every`` batches, triggers:
 
-1. **Evaluate** student on ALL tasks, identify hard tasks (0% success).
+1. **Identify hard tasks** from the RL batch (tasks with 0% success —
+   no separate student evaluation needed).
 2. **Self-Reflect** — generate compact hints from failed traces.
 3. **Teacher Re-attempt** — same model + privileged context re-attempts hard tasks.
 4. **Filter** — keep tasks where teacher succeeded but student failed.
@@ -121,6 +122,47 @@ def _make_builder_factory(
     return _terminal_factory
 
 
+def _build_task_results_from_rl_batch(
+    batch_tasks: list[Any],
+    trajectory_groups: list[Any],
+    preset_name: str | None,
+) -> list[eval_mod.TaskEvalResult]:
+    """Build per-task eval results from RL batch rollout data.
+
+    Groups rollouts by unique task (since random.choices may pick duplicates),
+    aggregates rewards and trajectories, and returns TaskEvalResult objects.
+    """
+    # Group by task identity (int index or task object).
+    task_data: dict[Any, dict[str, Any]] = {}
+    for task, tg in zip(batch_tasks, trajectory_groups, strict=True):
+        if tg is None:
+            continue
+        key = task
+        if key not in task_data:
+            task_data[key] = {"task": task, "rewards": [], "trajectories": []}
+        task_data[key]["rewards"].extend(tg.get_total_rewards())
+        task_data[key]["trajectories"].extend(tg.trajectories_G)
+
+    results: list[eval_mod.TaskEvalResult] = []
+    for info in task_data.values():
+        rewards = info["rewards"]
+        mean_reward = sum(rewards) / len(rewards) if rewards else 0.0
+        all_failed = all(r == 0.0 for r in rewards) if rewards else True
+        task_name = eval_mod._resolve_task_name(info["task"], preset_name)
+        results.append(
+            eval_mod.TaskEvalResult(
+                task=info["task"],
+                task_name=task_name,
+                rewards=rewards,
+                trajectories=info["trajectories"],
+                mean_reward=mean_reward,
+                all_failed=all_failed,
+            )
+        )
+
+    return results
+
+
 async def _do_rl_batch(
     config: opsd_config_mod.OPSDConfig,
     training_client: Any,
@@ -130,8 +172,14 @@ async def _do_rl_batch(
     ml_logger: Any,
     global_batch: int,
     builder_factory: Any,
-) -> Any:
-    """Run a single RL training batch. Returns updated sampling_client."""
+) -> tuple[Any, list[eval_mod.TaskEvalResult]]:
+    """Run a single RL training batch.
+
+    Returns:
+        (sampling_client, task_results) where task_results are per-task eval
+        results built from the RL rollout data (used by OPSD phases to skip
+        a separate student evaluation).
+    """
     tinker_train = importlib.import_module("tinker_cookbook.rl.train")
 
     t_start = time.time()
@@ -166,19 +214,22 @@ async def _do_rl_batch(
         ],
     )
 
+    # Build per-task results from RL data (for OPSD phases).
+    task_results = _build_task_results_from_rl_batch(batch_tasks, trajectory_groups, config.preset_name)
+
     # Filter None trajectory groups.
     valid_pairs = [(b, tg) for b, tg in zip(builders, trajectory_groups, strict=True) if tg is not None]
     if not valid_pairs:
         _LOGGER.warning("RL | batch %d | all rollouts failed, skipping", global_batch)
         ml_logger.log_metrics(metrics, step=global_batch)
-        return sampling_client
+        return sampling_client, task_results
 
     valid_builders = [p[0] for p in valid_pairs]
     valid_trajectory_groups = [p[1] for p in valid_pairs]
 
     # Train step.
     sampling_client, train_metrics = await tinker_train.do_train_step_and_get_sampling_client(
-        config=tinker_train.Config(
+        cfg=tinker_train.Config(
             model_name=config.model_name,
             log_path=config.log_path,
             dataset_builder=None,
@@ -201,7 +252,7 @@ async def _do_rl_batch(
     metrics["time/total"] = time.time() - t_start
     ml_logger.log_metrics(metrics, step=global_batch)
 
-    return sampling_client
+    return sampling_client, task_results
 
 
 async def _run_distillation_steps(
@@ -213,11 +264,16 @@ async def _run_distillation_steps(
     renderer: Any,
     ml_logger: Any,
     global_batch: int,
+    distill_buffer: list[dict[str, Any]] | None = None,
 ) -> tuple[Any, int]:
     """Run distillation gradient steps on ALL distillable tasks.
 
     Each step: student rollouts (standard) on all distillable tasks with the
     same ``group_size`` as RL, compute teacher KL, and train.
+
+    If ``config.distill_min_batch_size > 0``, data is accumulated in
+    ``distill_buffer`` and training only proceeds when the buffer contains
+    enough datums.  This prevents catastrophically small gradient updates.
     """
     tinker_train = importlib.import_module("tinker_cookbook.rl.train")
     rl_data = importlib.import_module("tinker_cookbook.rl.data_processing")
@@ -231,10 +287,11 @@ async def _run_distillation_steps(
     distill_task_names = [student_r.task_name for student_r, _ in distillable]
 
     _LOGGER.info(
-        "=== DISTILL | tasks=%d | steps=%d | group_size=%d ===",
+        "=== DISTILL | tasks=%d | steps=%d | group_size=%d | min_batch=%d ===",
         len(distill_tasks),
         config.num_distillation_steps,
         config.group_size,
+        config.distill_min_batch_size,
     )
 
     # --- Single rollout: student generates on-policy once ---
@@ -306,7 +363,46 @@ async def _run_distillation_steps(
         rollout_time,
     )
 
-    # --- Multiple gradient steps on the same on-policy data ---
+    # --- Check minimum batch size threshold ---
+    if config.distill_min_batch_size > 0 and distill_buffer is not None:
+        distill_buffer.extend(data_d)
+        _LOGGER.info(
+            "DISTILL | accumulated %d datums in buffer (total=%d, min=%d)",
+            len(data_d),
+            len(distill_buffer),
+            config.distill_min_batch_size,
+        )
+        if len(distill_buffer) < config.distill_min_batch_size:
+            _LOGGER.info(
+                "DISTILL | buffer below threshold (%d < %d), deferring training",
+                len(distill_buffer),
+                config.distill_min_batch_size,
+            )
+            # Log that we skipped but accumulated.
+            skip_metrics: dict[str, Any] = {
+                "progress/batch": global_batch,
+                "opsd/phase": "distill_deferred",
+                "opsd/distill/buffer_size": len(distill_buffer),
+                "opsd/distill/num_datums_this_cycle": len(data_d),
+                "opsd/distill/num_valid_groups": len(valid_triples),
+                "opsd/distill_num_tasks": len(distill_tasks),
+            }
+            skip_metrics.update(kl_metrics)
+            ml_logger.log_metrics(skip_metrics, step=global_batch)
+            return sampling_client, global_batch
+
+        # Buffer is large enough — train on the full buffer.
+        _LOGGER.info(
+            "DISTILL | buffer ready (%d >= %d), training on full buffer",
+            len(distill_buffer),
+            config.distill_min_batch_size,
+        )
+        data_d = list(distill_buffer)
+        distill_buffer.clear()
+
+    distill_lr = config.effective_distill_learning_rate
+
+    # --- Gradient steps on the on-policy data ---
     for step_idx in range(config.num_distillation_steps):
         t_start = time.time()
         metrics: dict[str, Any] = {
@@ -316,17 +412,20 @@ async def _run_distillation_steps(
             "opsd/distill_num_tasks": len(distill_tasks),
             "opsd/distill/num_valid_groups": len(valid_triples),
             "opsd/distill/num_datums": len(data_d),
+            "opsd/distill/learning_rate": distill_lr,
         }
         metrics.update(traj_metrics)
         metrics.update(kl_metrics)
 
-        # Train step on the same data.
-        sampling_client = await tinker_train.train_step(
-            training_client=training_client,
+        # Train step on the data.
+        await tinker_train.train_step(
             data_D=data_d,
-            learning_rate=config.learning_rate,
+            training_client=training_client,
+            learning_rate=distill_lr,
+            num_substeps=1,
             loss_fn=config.loss_fn,
         )
+        sampling_client = await training_client.save_weights_and_get_sampling_client_async()
 
         metrics["time/total"] = time.time() - t_start
         if step_idx == 0:
@@ -353,61 +452,113 @@ async def _run_opsd_phases(
     config: opsd_config_mod.OPSDConfig,
     training_client: Any,
     sampling_client: Any,
-    tasks: list[Any],
+    rl_batch_results: list[eval_mod.TaskEvalResult],
     renderer: Any,
     tokenizer: Any,
     ml_logger: Any,
     global_batch: int,
+    distill_buffer: list[dict[str, Any]] | None = None,
+    reflection_cache: dict[str, tuple[str, int]] | None = None,
 ) -> tuple[Any, int]:
-    """Run all OPSD phases: eval → reflect → teacher → filter → distill."""
+    """Run OPSD phases: (RL results as eval) → reflect → teacher → filter → distill.
+
+    Instead of a separate student evaluation phase, uses per-task results
+    from the RL batch to identify hard tasks (0% success).  This avoids
+    redundant rollouts on tasks we already have data for.
+
+    Args:
+        distill_buffer: Shared buffer that accumulates distillation datums
+            across OPSD cycles when ``config.distill_min_batch_size > 0``.
+        reflection_cache: Mapping of task_name → (reflection_text, age_in_cycles).
+            Reused for up to ``config.reflection_cache_cycles`` consecutive cycles
+            to save LLM calls and speed up OPSD phases.
+    """
     checkpoint_utils = importlib.import_module("tinker_cookbook.checkpoint_utils")
 
-    # Phase 1: Evaluate student on ALL tasks.
-    builder_factory = _make_builder_factory(config, renderer)
-    eval_result = await eval_mod.evaluate_tasks(
-        sampling_client,
-        tasks,
-        config,
-        group_size=config.eval_group_size,
-        builder_factory=builder_factory,
-        phase_label="student_eval",
-    )
+    # Use RL batch results as student eval (no separate evaluation phase).
+    hard_tasks = [r for r in rl_batch_results if r.all_failed]
+    solved_tasks = [r for r in rl_batch_results if not r.all_failed]
+    all_rewards = [r.mean_reward for r in rl_batch_results]
+    mean_reward = sum(all_rewards) / len(all_rewards) if all_rewards else 0.0
 
-    # Log evaluation metrics.
+    # Log evaluation metrics (from RL batch data).
     eval_metrics: dict[str, Any] = {
-        "opsd/eval/total_tasks": len(eval_result.task_results),
-        "opsd/eval/num_hard": eval_result.num_hard,
-        "opsd/eval/num_solved": eval_result.num_solved,
-        "opsd/eval/solve_rate": eval_result.num_solved / max(1, len(eval_result.task_results)),
-        "opsd/eval/mean_reward": eval_result.mean_reward,
+        "opsd/eval/total_tasks": len(rl_batch_results),
+        "opsd/eval/num_hard": len(hard_tasks),
+        "opsd/eval/num_solved": len(solved_tasks),
+        "opsd/eval/solve_rate": len(solved_tasks) / max(1, len(rl_batch_results)),
+        "opsd/eval/mean_reward": mean_reward,
+        "opsd/eval/source": "rl_batch",
         "opsd/phase": "eval",
     }
-    for tr in eval_result.task_results:
+    for tr in rl_batch_results:
         eval_metrics[f"opsd/task/{tr.task_name}/student_reward"] = tr.mean_reward
         eval_metrics[f"opsd/task/{tr.task_name}/is_hard"] = float(tr.all_failed)
     ml_logger.log_metrics(eval_metrics, step=global_batch)
 
-    _save_opsd_state(
-        config.log_path, "eval_done", global_batch, hard_task_names=[r.task_name for r in eval_result.hard_tasks]
+    _LOGGER.info(
+        "OPSD EVAL (from RL batch) | tasks=%d | solved=%d | hard=%d | mean_reward=%.3f",
+        len(rl_batch_results),
+        len(solved_tasks),
+        len(hard_tasks),
+        mean_reward,
     )
 
+    _save_opsd_state(config.log_path, "eval_done", global_batch, hard_task_names=[r.task_name for r in hard_tasks])
+
     # Early exit: no hard tasks.
-    if not eval_result.hard_tasks:
+    if not hard_tasks:
         _LOGGER.info("No hard tasks — all solved! Skipping OPSD phases.")
         return sampling_client, global_batch
 
-    # Phase 2: Self-reflection.
-    reflections = await reflection_mod.generate_reflections(
-        sampling_client,
-        eval_result.hard_tasks,
-        config,
-        renderer,
-        tokenizer,
+    # Phase 2: Self-reflection (with caching).
+    # Check which tasks already have a fresh-enough cached reflection.
+    tasks_needing_reflection: list[eval_mod.TaskEvalResult] = []
+    cached_reflections: dict[str, str] = {}
+    cache_max_age = config.reflection_cache_cycles
+
+    if reflection_cache is not None and cache_max_age > 0:
+        for task_r in hard_tasks:
+            cached = reflection_cache.get(task_r.task_name)
+            if cached is not None:
+                text, age = cached
+                if age < cache_max_age:
+                    cached_reflections[task_r.task_name] = text
+                    # Increment age.
+                    reflection_cache[task_r.task_name] = (text, age + 1)
+                    continue
+            tasks_needing_reflection.append(task_r)
+    else:
+        tasks_needing_reflection = list(hard_tasks)
+
+    # Generate new reflections only for tasks without a cache hit.
+    if tasks_needing_reflection:
+        new_reflections = await reflection_mod.generate_reflections(
+            sampling_client,
+            tasks_needing_reflection,
+            config,
+            renderer,
+            tokenizer,
+        )
+        # Store in cache.
+        if reflection_cache is not None:
+            for task_name, text in new_reflections.items():
+                reflection_cache[task_name] = (text, 0)
+        cached_reflections.update(new_reflections)
+
+    reflections = cached_reflections
+
+    _LOGGER.info(
+        "REFLECTION | total=%d | cached=%d | new=%d",
+        len(reflections),
+        len(hard_tasks) - len(tasks_needing_reflection),
+        len(tasks_needing_reflection),
     )
 
     reflection_metrics: dict[str, Any] = {
-        "opsd/reflection/num_tasks": len(eval_result.hard_tasks),
-        "opsd/reflection/num_generated": len(reflections),
+        "opsd/reflection/num_tasks": len(hard_tasks),
+        "opsd/reflection/num_generated": len(tasks_needing_reflection),
+        "opsd/reflection/num_cached": len(hard_tasks) - len(tasks_needing_reflection),
         "opsd/phase": "reflection",
     }
     ml_logger.log_metrics(reflection_metrics, step=global_batch)
@@ -416,7 +567,7 @@ async def _run_opsd_phases(
         config.log_path,
         "reflection_done",
         global_batch,
-        hard_task_names=[r.task_name for r in eval_result.hard_tasks],
+        hard_task_names=[r.task_name for r in hard_tasks],
         reflections=reflections,
     )
 
@@ -427,7 +578,7 @@ async def _run_opsd_phases(
         privileged=True,
         reflections=reflections,
     )
-    teacher_tasks = [r.task for r in eval_result.hard_tasks]
+    teacher_tasks = [r.task for r in hard_tasks]
     teacher_result = await eval_mod.evaluate_tasks(
         sampling_client,
         teacher_tasks,
@@ -439,9 +590,9 @@ async def _run_opsd_phases(
 
     # Log teacher metrics.
     teacher_metrics: dict[str, Any] = {
-        "opsd/teacher/num_attempted": len(eval_result.hard_tasks),
+        "opsd/teacher/num_attempted": len(hard_tasks),
         "opsd/teacher/num_solved": teacher_result.num_solved,
-        "opsd/teacher/solve_rate_on_hard": teacher_result.num_solved / max(1, len(eval_result.hard_tasks)),
+        "opsd/teacher/solve_rate_on_hard": teacher_result.num_solved / max(1, len(hard_tasks)),
         "opsd/teacher/mean_reward": teacher_result.mean_reward,
         "opsd/phase": "teacher",
     }
@@ -451,7 +602,7 @@ async def _run_opsd_phases(
     ml_logger.log_metrics(teacher_metrics, step=global_batch)
 
     # Phase 4: Filter teacher-solved.
-    distillable = eval_mod.filter_teacher_solved(eval_result.hard_tasks, teacher_result)
+    distillable = eval_mod.filter_teacher_solved(hard_tasks, teacher_result)
     if not distillable:
         _LOGGER.info("Teacher couldn't solve any hard tasks. Skipping distillation.")
         return sampling_client, global_batch
@@ -466,6 +617,7 @@ async def _run_opsd_phases(
         renderer,
         ml_logger,
         global_batch,
+        distill_buffer=distill_buffer,
     )
 
     _save_opsd_state(config.log_path, "distill_done", global_batch)
@@ -586,6 +738,14 @@ async def run_opsd_training(config: opsd_config_mod.OPSDConfig) -> None:
 
     builder_factory = _make_builder_factory(config, renderer)
 
+    # Distillation replay buffer: accumulates datums across OPSD cycles
+    # until we have enough for a stable gradient update.
+    distill_buffer: list[dict[str, Any]] = []
+
+    # Reflection cache: avoids re-generating reflections for the same hard
+    # tasks across consecutive OPSD cycles.  Maps task_name → (text, age).
+    reflection_cache: dict[str, tuple[str, int]] = {}
+
     _LOGGER.info(
         "Starting OPSD training: harness=%s, model=%s, tasks=%d, num_batches=%d, opsd_every=%d",
         config.harness,
@@ -594,6 +754,14 @@ async def run_opsd_training(config: opsd_config_mod.OPSDConfig) -> None:
         config.num_batches,
         config.opsd_every,
     )
+    if config.distill_min_batch_size > 0:
+        _LOGGER.info("Distillation replay buffer enabled: min_batch_size=%d", config.distill_min_batch_size)
+    if config.effective_distill_learning_rate != config.learning_rate:
+        _LOGGER.info(
+            "Distillation learning rate: %s (RL: %s)",
+            config.effective_distill_learning_rate,
+            config.learning_rate,
+        )
 
     # Apply monkey-patches for the entire OPSD training.
     with monkey_patches.MonkeyPatchContext(
@@ -609,7 +777,7 @@ async def run_opsd_training(config: opsd_config_mod.OPSDConfig) -> None:
             )
 
             # RL batch.
-            sampling_client = await _do_rl_batch(
+            sampling_client, rl_batch_results = await _do_rl_batch(
                 config,
                 training_client,
                 sampling_client,
@@ -632,18 +800,21 @@ async def run_opsd_training(config: opsd_config_mod.OPSDConfig) -> None:
 
             global_batch += 1
 
-            # OPSD phases every N batches.
+            # OPSD phases every N batches — uses RL batch results as student
+            # eval (no separate evaluation on all tasks).
             if (batch_idx + 1) % config.opsd_every == 0:
                 _LOGGER.info("========== OPSD PHASES after batch %d ==========", batch_idx + 1)
                 sampling_client, global_batch = await _run_opsd_phases(
                     config,
                     training_client,
                     sampling_client,
-                    tasks,
+                    rl_batch_results,
                     renderer,
                     tokenizer,
                     ml_logger,
                     global_batch,
+                    distill_buffer=distill_buffer,
+                    reflection_cache=reflection_cache,
                 )
 
     # Save final checkpoint.
