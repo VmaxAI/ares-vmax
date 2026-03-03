@@ -68,19 +68,25 @@ def _log_rollout_complete(task_label: str, result: Any, num_envs: int, elapsed: 
     )
 
 
-async def run_training(config: config_mod.TrainingConfig) -> None:
+async def run_training(config: config_mod.TrainingConfig, tasks: list | None = None) -> None:
     """Run terminal-based RL training with the given configuration.
 
     This is the main entry point. It:
     1. Validates env vars (TINKER_API_KEY, optionally DAYTONA_API_KEY).
-    2. Loads tasks from task_dir or ARES preset.
+    2. Loads tasks from task_dir or ARES preset (unless ``tasks`` is provided).
     3. Creates the TerminalRLDatasetBuilder.
     4. Configures tinker_cookbook.rl.train.Config with proven defaults.
     5. Monkey-patches optim_step for grad clipping.
     6. Monkey-patches do_group_rollout_and_filter_constant_reward for error resilience.
     7. Calls tinker_cookbook.rl.train.main(cfg).
+
+    Args:
+        config: Training configuration.
+        tasks: Optional pre-loaded list of harbor.Task objects. When provided,
+            skips task loading from task_dir/preset_name. This allows callers
+            (e.g., demiurge-swe) to inject tasks directly.
     """
-    config.validate()
+    config.validate(allow_no_task_source=tasks is not None)
 
     # Fail fast if env vars aren't set.
     if "TINKER_API_KEY" not in os.environ:
@@ -126,7 +132,9 @@ async def run_training(config: config_mod.TrainingConfig) -> None:
         )
     else:
         # Terminal harness (default) — tmux + JSON commands.
-        if config.task_dir:
+        if tasks is not None:
+            _LOGGER.info("Using %d injected tasks (skipping task_dir/preset loading)", len(tasks))
+        elif config.task_dir:
             tasks = dataset.load_tasks_from_task_dir(config.task_dir)
             _LOGGER.info("Loaded 1 task from task_dir: %s", config.task_dir)
         else:

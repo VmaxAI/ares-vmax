@@ -84,16 +84,23 @@ class TrainingConfig:
     base_url: str | None = None
     load_checkpoint_path: str | None = None
 
-    def validate(self) -> None:
-        """Validate the configuration. Raises ValueError on invalid state."""
+    def validate(self, allow_no_task_source: bool = False) -> None:
+        """Validate the configuration. Raises ValueError on invalid state.
+
+        Args:
+            allow_no_task_source: When True, skip the task_dir/preset_name
+                requirement. Used when tasks are injected directly via
+                ``run_training(config, tasks=...)``.
+        """
         if self.harness not in ("terminal", "code-agent"):
             raise ValueError(f"harness must be 'terminal' or 'code-agent', got {self.harness!r}")
         if not self.model_name:
             raise ValueError("model_name is required")
         if not self.log_path:
             raise ValueError("log_path is required")
-        if not self.task_dir and not self.preset_name:
-            raise ValueError("Either task_dir or preset_name must be specified")
+        if not allow_no_task_source:
+            if not self.task_dir and not self.preset_name:
+                raise ValueError("Either task_dir or preset_name must be specified")
         if self.task_dir and self.preset_name:
             raise ValueError("Only one of task_dir or preset_name can be specified")
         if self.harness == "code-agent" and not self.preset_name:
