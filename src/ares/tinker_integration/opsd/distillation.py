@@ -90,6 +90,12 @@ async def compute_teacher_logprobs_for_datum(
     offset = len(priv_tokens)
     teacher_logprobs_for_student = all_logprobs[offset + 1 :]
 
+    expected_len = len(datum.loss_fn_inputs["target_tokens"].to_ints())
+    assert len(teacher_logprobs_for_student) == expected_len, (
+        f"Teacher/student logprob length mismatch: got {len(teacher_logprobs_for_student)}, "
+        f"expected {expected_len}. Check offset calculation and tinker data structures."
+    )
+
     return teacher_logprobs_for_student
 
 
@@ -158,6 +164,13 @@ async def incorporate_teacher_kl(
 
         # Pad if teacher logprobs are shorter.
         if len(teacher_lp) < target_len:
+            _LOGGER.warning(
+                "Teacher logprobs (%d) shorter than student (%d); zero-padding."
+                " Zero-padding sets teacher log-prob to 0.0 (prob=1.0) for missing"
+                " positions, which may produce unexpected KL values.",
+                len(teacher_lp),
+                target_len,
+            )
             pad = torch.zeros(target_len - len(teacher_lp))
             teacher_lp = torch.cat([teacher_lp, pad])
 
