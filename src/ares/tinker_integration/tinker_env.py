@@ -270,21 +270,37 @@ class HarborTerminalTinkerEnv:
         # 4) Determine done + reward.
         episode_done = bool(parsed.task_complete)
         reward = 0.0
+        meta: dict[str, Any] = {}
         if episode_done:
             _, reduced = await self._gym_env.verify()
             reward = float(reduced) if isinstance(reduced, (int, float)) else 0.0
+            meta = self._gym_env.get_meta_results()
 
         # 5) Build next observation for continuing episodes.
         too_long = 0.0
         if episode_done:
             next_observation = tinker.ModelInput.empty()
-            _LOGGER.info(
-                "ENV DONE  | task=%s | trial=%s | step=%d | reason=task_complete | reward=%.3f",
-                self._task_name,
-                self._trial_name,
-                self._step_count,
-                reward,
-            )
+            if meta:
+                _LOGGER.info(
+                    "ENV DONE  | task=%s | trial=%s | step=%d | reason=task_complete | reward=%.3f | "
+                    "patch=%s | valid=%s | frontier_solved=%s | reason=%s",
+                    self._task_name,
+                    self._trial_name,
+                    self._step_count,
+                    reward,
+                    meta.get("produces_patch"),
+                    meta.get("bug_is_valid"),
+                    meta.get("strong_resolved"),
+                    meta.get("failure_reason") or "ok",
+                )
+            else:
+                _LOGGER.info(
+                    "ENV DONE  | task=%s | trial=%s | step=%d | reason=task_complete | reward=%.3f",
+                    self._task_name,
+                    self._trial_name,
+                    self._step_count,
+                    reward,
+                )
             await self._gym_env.close()
         else:
             # New user prompt contains fresh terminal state.
@@ -321,15 +337,21 @@ class HarborTerminalTinkerEnv:
                     self._max_trajectory_tokens,
                 )
 
+        metrics: dict[str, float] = {
+            "parse_success": float(bool(parse_success)),
+            "json_ok": json_ok,
+            "num_commands": num_commands,
+            "too_long": too_long,
+        }
+        if meta:
+            metrics["bug_valid"] = float(meta.get("bug_is_valid", False))
+            metrics["frontier_solved"] = float(meta.get("strong_resolved", False))
+            metrics["produces_patch"] = float(meta.get("produces_patch", False))
+
         return step_result_cls(
             reward=reward,
             episode_done=episode_done,
             next_observation=next_observation,
             next_stop_condition=self.stop_condition,
-            metrics={
-                "parse_success": float(bool(parse_success)),
-                "json_ok": json_ok,
-                "num_commands": num_commands,
-                "too_long": too_long,
-            },
+            metrics=metrics,
         )

@@ -56,8 +56,19 @@ def _log_rollout_complete(task_label: str, result: Any, num_envs: int, elapsed: 
     reward_parts = " ".join(f"{r:.2f}" for r in rewards)
     turns_parts = " ".join(str(t) for t in turns)
 
+    # Extract meta-task aggregate metrics from trajectory step metrics.
+    meta_stats = _extract_meta_stats(result)
+    meta_suffix = ""
+    if meta_stats:
+        n = meta_stats["total"]
+        meta_suffix = (
+            f" | patches={meta_stats['patches']}/{n}"
+            f" | valid={meta_stats['valid']}/{n}"
+            f" | frontier_solved={meta_stats['frontier_solved']}/{n}"
+        )
+
     _LOGGER.info(
-        "Rollout done | task=%s | %.1fs | envs=%d | reward=%.3f [%s] | turns=%.1f [%s] | sandboxes: closed",
+        "Rollout done | task=%s | %.1fs | envs=%d | reward=%.3f [%s] | turns=%.1f [%s]%s | sandboxes: closed",
         task_label,
         elapsed,
         num_envs,
@@ -65,7 +76,40 @@ def _log_rollout_complete(task_label: str, result: Any, num_envs: int, elapsed: 
         reward_parts,
         mean_turns,
         turns_parts,
+        meta_suffix,
     )
+
+
+def _extract_meta_stats(result: Any) -> dict[str, int]:
+    """Extract aggregate meta-task stats from trajectory metrics.
+
+    Looks for ``bug_valid``, ``frontier_solved``, ``produces_patch`` in the
+    final step metrics of each trajectory. Returns empty dict if no meta
+    metrics are found (non-meta-task rollout).
+    """
+    total = 0
+    patches = 0
+    valid = 0
+    frontier_solved = 0
+
+    for trajectory in result.trajectories_G:
+        if not trajectory.transitions:
+            continue
+        # The last transition holds the final StepResult.metrics.
+        last_metrics = getattr(trajectory.transitions[-1], "metrics", None)
+        if last_metrics is None or "bug_valid" not in last_metrics:
+            continue
+        total += 1
+        if last_metrics.get("produces_patch", 0.0) > 0:
+            patches += 1
+        if last_metrics.get("bug_valid", 0.0) > 0:
+            valid += 1
+        if last_metrics.get("frontier_solved", 0.0) > 0:
+            frontier_solved += 1
+
+    if total == 0:
+        return {}
+    return {"total": total, "patches": patches, "valid": valid, "frontier_solved": frontier_solved}
 
 
 async def run_training(config: config_mod.TrainingConfig, tasks: list | None = None) -> None:
@@ -113,23 +157,41 @@ async def run_training(config: config_mod.TrainingConfig, tasks: list | None = N
 
     dataset_builder: Any
     if config.harness == "code-agent":
-        # ARES CodeEnvironment harness — wraps ares.make() environments.
-        assert config.preset_name is not None  # guaranteed by validate()
+        # ARES CodeEnvironment harness — wraps ares.make() or injected tasks.
         container_factory = ares_env._get_container_factory(config.env_type)
-        dataset_builder = ares_env.AresRLDatasetBuilder(
-            preset_name=config.preset_name,
-            num_tasks=config.num_tasks,
-            group_size=config.group_size,
-            container_factory=container_factory,
-            groups_per_batch=config.groups_per_batch,
-            num_batches=config.num_batches,
-            renderer_name=config.renderer_name,
-            model_name_for_tokenizer=config.model_name,
-            max_trajectory_tokens=config.max_trajectory_tokens,
-            max_tokens=config.max_tokens,
-            builder_buffer=builder_buffer,
-            snapshot_template_name=config.snapshot_template_name,
-        )
+        if tasks is not None:
+            # Task-based builder: demiurge-swe injects Harbor Task objects directly.
+            _LOGGER.info("Using %d injected tasks with code-agent harness", len(tasks))
+            dataset_builder = ares_env.AresRLDatasetBuilder(
+                tasks=tasks,
+                group_size=config.group_size,
+                container_factory=container_factory,
+                groups_per_batch=config.groups_per_batch,
+                num_batches=config.num_batches,
+                renderer_name=config.renderer_name,
+                model_name_for_tokenizer=config.model_name,
+                max_trajectory_tokens=config.max_trajectory_tokens,
+                max_tokens=config.max_tokens,
+                builder_buffer=builder_buffer,
+                snapshot_template_name=config.snapshot_template_name,
+            )
+        else:
+            # Preset-based builder: tasks from ARES registry.
+            assert config.preset_name is not None  # guaranteed by validate()
+            dataset_builder = ares_env.AresRLDatasetBuilder(
+                preset_name=config.preset_name,
+                num_tasks=config.num_tasks,
+                group_size=config.group_size,
+                container_factory=container_factory,
+                groups_per_batch=config.groups_per_batch,
+                num_batches=config.num_batches,
+                renderer_name=config.renderer_name,
+                model_name_for_tokenizer=config.model_name,
+                max_trajectory_tokens=config.max_trajectory_tokens,
+                max_tokens=config.max_tokens,
+                builder_buffer=builder_buffer,
+                snapshot_template_name=config.snapshot_template_name,
+            )
     else:
         # Terminal harness (default) — tmux + JSON commands.
         if tasks is not None:

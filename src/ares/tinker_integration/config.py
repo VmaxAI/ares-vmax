@@ -103,8 +103,8 @@ class TrainingConfig:
                 raise ValueError("Either task_dir or preset_name must be specified")
         if self.task_dir and self.preset_name:
             raise ValueError("Only one of task_dir or preset_name can be specified")
-        if self.harness == "code-agent" and not self.preset_name:
-            raise ValueError("code-agent harness requires preset_name (task_dir is not supported)")
+        if self.harness == "code-agent" and not self.preset_name and not allow_no_task_source:
+            raise ValueError("code-agent harness requires preset_name or injected tasks (task_dir is not supported)")
         if self.group_size <= 0:
             raise ValueError("group_size must be positive")
         if self.groups_per_batch <= 0:

@@ -14,6 +14,7 @@ import asyncio
 import contextlib
 from dataclasses import dataclass
 import importlib
+import json
 import logging
 from pathlib import Path
 import random
@@ -171,8 +172,14 @@ _VERIFY_BASE_DELAY = 5.0  # seconds
 def _is_transient_error(exc: BaseException) -> bool:
     """Return True if the exception looks like a transient/rate-limit error worth retrying."""
     msg = str(exc).lower()
-    # Daytona SDK raises generic exceptions with "429" or "too many requests" in the message.
-    if "429" in msg or "too many requests" in msg or "rate limit" in msg:
+    # Daytona SDK raises DaytonaRateLimitError (class name contains "ratelimit" without space).
+    # When tenacity exhausts retries, it wraps the last exception in RetryError, so the str
+    # representation is e.g. "RetryError[...DaytonaRateLimitError>]".
+    if "429" in msg or "too many requests" in msg or "rate limit" in msg or "ratelimit" in msg:
+        return True
+    # tenacity.RetryError wrapping any DaytonaError is transient — the inner retries just
+    # weren't enough, but a longer backoff in the outer loop usually succeeds.
+    if "retryerror" in msg and "daytonaerror" in msg:
         return True
     # Connection-level transient errors.
     return any(kw in msg for kw in ("connection", "timeout", "temporary", "unavailable", "503", "502"))
@@ -220,6 +227,40 @@ def _patch_daytona_sandbox_params(
         return await original_create(params)
 
     env._create_sandbox = _patched_create_sandbox
+
+
+def _resolve_snapshot_from_entity_info(env: Any, task: Any) -> None:
+    """Resolve the concrete snapshot name from entity_info.json.
+
+    When tasks share a per-repo snapshot (e.g., ``swesmith-meta-chalk__chalk.51557784``),
+    the global ``snapshot_template_name`` (e.g., ``swesmith-meta-{name}``) resolves
+    incorrectly because Harbor substitutes the full task name, not the repo name.
+
+    This reads ``meta_snapshot_name`` from the task's ``entity_info.json`` and patches
+    the environment's ``_snapshot_template_name`` to the concrete per-repo value.
+    ``.format(name=...)`` on a string without ``{name}`` is a no-op, so Harbor's
+    existing resolution code works unchanged.
+    """
+    if not hasattr(env, "_snapshot_template_name") or env._snapshot_template_name is None:
+        return
+
+    # entity_info.json may live in tests/ or environment/ within the task directory.
+    for subdir in ("tests", "environment"):
+        entity_info_path = Path(task.paths.task_dir) / subdir / "entity_info.json"
+        if entity_info_path.is_file():
+            try:
+                info = json.loads(entity_info_path.read_text())
+                snapshot_name = info.get("meta_snapshot_name")
+                if snapshot_name:
+                    _LOGGER.debug(
+                        "Resolved snapshot for task=%s: %s (from entity_info.json)",
+                        task.name,
+                        snapshot_name,
+                    )
+                    env._snapshot_template_name = snapshot_name
+                    return
+            except (json.JSONDecodeError, OSError) as exc:
+                _LOGGER.debug("Could not read entity_info.json from %s: %s", entity_info_path, exc)
 
 
 class AsyncTerminalGymEnv:
@@ -296,6 +337,11 @@ class AsyncTerminalGymEnv:
             sandbox_memory_gb=sandbox_memory_gb,
             sandbox_disk_gb=sandbox_disk_gb,
         )
+
+        # Resolve per-repo snapshot name from entity_info.json (if available).
+        # The global snapshot_template_name resolves {name} to the full task name,
+        # but snapshots are per-repo. This patches to the concrete snapshot name.
+        _resolve_snapshot_from_entity_info(self._environment, self._task)
 
         self._tmux: Any | None = None
         self._verifier: Any | None = None
@@ -448,6 +494,21 @@ class AsyncTerminalGymEnv:
                         e,
                     )
         return None
+
+    def get_meta_results(self) -> dict[str, Any]:
+        """Return structured meta-task results from /logs/verifier/meta_results.json.
+
+        Must be called after verification (step with done=True or verify()).
+        Returns an empty dict if no meta results were found (e.g., non-meta-task
+        or file was not written by test.sh).
+        """
+        meta_path = self._trial_paths.verifier_dir / "meta_results.json"
+        if meta_path.is_file():
+            try:
+                return json.loads(meta_path.read_text())
+            except (json.JSONDecodeError, OSError) as exc:
+                _LOGGER.debug("Could not read meta_results.json from %s: %s", meta_path, exc)
+        return {}
 
     async def step(self, action: TerminalAction) -> StepResult:
         if not self._started or self._tmux is None:

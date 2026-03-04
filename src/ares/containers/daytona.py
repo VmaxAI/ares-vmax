@@ -31,7 +31,7 @@ def _get_daytona_client_sync() -> daytona.Daytona:
 
 @tenacity.retry(
     retry=tenacity.retry_if_exception_type(daytona.common.errors.DaytonaError),
-    stop=tenacity.stop_after_attempt(3),
+    stop=tenacity.stop_after_attempt(5),
     wait=tenacity.wait_exponential_jitter(max=60),
     before_sleep=tenacity.before_sleep_log(_LOGGER, logging.INFO),
 )
@@ -41,7 +41,7 @@ async def _create_sandbox_with_retry(params: daytona.CreateSandboxFromImageParam
 
 @tenacity.retry(
     retry=tenacity.retry_if_exception_type(daytona.common.errors.DaytonaError),
-    stop=tenacity.stop_after_attempt(3),
+    stop=tenacity.stop_after_attempt(5),
     wait=tenacity.wait_exponential_jitter(max=60),
     before_sleep=tenacity.before_sleep_log(_LOGGER, logging.INFO),
 )

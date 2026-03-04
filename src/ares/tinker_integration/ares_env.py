@@ -183,14 +183,31 @@ class AresCodeTinkerEnv:
         episode_done = ts.last()
         reward = ts.reward or 0.0
         too_long = 0.0
+        meta: dict[str, Any] = {}
 
         if episode_done:
-            _LOGGER.info(
-                "ENV DONE  | task=%s | step=%d | reason=task_complete | reward=%.3f",
-                self._task_name,
-                self._step_count,
-                reward,
-            )
+            # Read meta-results from the underlying environment (if available).
+            if hasattr(self._env, "get_meta_results"):
+                meta = self._env.get_meta_results()
+            if meta:
+                _LOGGER.info(
+                    "ENV DONE  | task=%s | step=%d | reason=task_complete | reward=%.3f | "
+                    "patch=%s | valid=%s | frontier_solved=%s | reason=%s",
+                    self._task_name,
+                    self._step_count,
+                    reward,
+                    meta.get("produces_patch"),
+                    meta.get("bug_is_valid"),
+                    meta.get("strong_resolved"),
+                    meta.get("failure_reason") or "ok",
+                )
+            else:
+                _LOGGER.info(
+                    "ENV DONE  | task=%s | step=%d | reason=task_complete | reward=%.3f",
+                    self._task_name,
+                    self._step_count,
+                    reward,
+                )
             await self._env.__aexit__(None, None, None)
             self._closed = True
             next_observation = tinker.ModelInput.empty()
@@ -226,16 +243,22 @@ class AresCodeTinkerEnv:
                     self._max_trajectory_tokens,
                 )
 
+        metrics: dict[str, float] = {
+            "parse_success": float(bool(parse_success)),
+            "reward": reward,
+            "too_long": too_long,
+        }
+        if meta:
+            metrics["bug_valid"] = float(meta.get("bug_is_valid", False))
+            metrics["frontier_solved"] = float(meta.get("strong_resolved", False))
+            metrics["produces_patch"] = float(meta.get("produces_patch", False))
+
         return step_result_cls(
             reward=reward,
             episode_done=episode_done,
             next_observation=next_observation,
             next_stop_condition=self.stop_condition,
-            metrics={
-                "parse_success": float(bool(parse_success)),
-                "reward": reward,
-                "too_long": too_long,
-            },
+            metrics=metrics,
         )
 
     async def close(self) -> None:
@@ -249,17 +272,22 @@ class AresCodeTinkerEnv:
 
 
 class AresEnvGroupBuilder:
-    """Build a group of AresCodeTinkerEnv instances for a single task index.
+    """Build a group of AresCodeTinkerEnv instances for a single task.
 
-    Creates ``group_size`` environments for the *same* task (via ``ares.make(preset:idx)``),
-    collects trajectories, and lets the RL algorithm center rewards within the group.
+    Supports two modes:
+    - **Preset mode**: Creates ``group_size`` environments via ``ares.make(preset:idx)``.
+    - **Task mode**: Creates ``group_size`` environments from an injected ``harbor.Task`` object,
+      wrapping it in a ``CodeEnvironment`` directly. Used by demiurge-swe to inject meta-tasks.
+
+    Collects trajectories and lets the RL algorithm center rewards within the group.
     """
 
     def __init__(
         self,
         *,
-        preset_name: str,
-        task_idx: int,
+        preset_name: str | None = None,
+        task_idx: int = 0,
+        task: Any | None = None,
         group_size: int,
         renderer: tinker_env.RendererProtocol,
         container_factory: containers.ContainerFactory,
@@ -267,8 +295,12 @@ class AresEnvGroupBuilder:
         max_tokens: int = 4096,
         snapshot_template_name: str | None = None,
     ):
+        if task is None and preset_name is None:
+            raise ValueError("Either preset_name or task must be provided")
+
         self._preset_name = preset_name
         self._task_idx = int(task_idx)
+        self._task = task
         self._group_size = int(group_size)
         if self._group_size <= 0:
             raise ValueError("group_size must be positive")
@@ -283,8 +315,32 @@ class AresEnvGroupBuilder:
         importlib.import_module("tinker")
         importlib.import_module("tinker_cookbook")
 
+        from ares.environments import code_env
+
+        if self._task is not None:
+            # Task mode: wrap injected Harbor Task in CodeEnvironment directly.
+            task_name = getattr(self._task, "name", "injected-task")
+            envs: list[AresCodeTinkerEnv] = []
+            for _ in range(self._group_size):
+                env = code_env.CodeEnvironment(
+                    tasks=[self._task],
+                    container_factory=self._container_factory,
+                    snapshot_template_name=self._snapshot_template_name,
+                )
+                envs.append(
+                    AresCodeTinkerEnv(
+                        env=env,
+                        renderer=self._renderer,
+                        max_trajectory_tokens=self._max_trajectory_tokens,
+                        max_tokens=self._max_tokens,
+                        task_name=task_name,
+                    )
+                )
+            return envs
+
+        # Preset mode: use ares.make() registry.
         task_name = f"{self._preset_name}:{self._task_idx}"
-        envs: list[AresCodeTinkerEnv] = []
+        envs = []
         for _ in range(self._group_size):
             env = ares.make(
                 task_name,
@@ -310,21 +366,30 @@ class AresEnvGroupBuilder:
         return [(0.0, {}) for _ in range(len(trajectory_group))]
 
     def logging_tags(self) -> list[str]:
+        if self._task is not None:
+            task_name = getattr(self._task, "name", "injected-task")
+            return ["ares-code-agent", task_name]
         return ["ares-code-agent", f"{self._preset_name}:{self._task_idx}"]
 
 
 class AresRLDatasetBuilder:
     """tinker-cookbook-compatible RLDatasetBuilder for ARES CodeEnvironment tasks.
 
+    Supports two modes:
+    - **Preset mode**: Uses ``preset_name`` to load tasks from the ARES registry.
+    - **Task mode**: Uses ``tasks`` (list of ``harbor.Task`` objects) injected directly
+      by the caller (e.g., demiurge-swe P1 pipeline).
+
     Creates a ``TerminalRLDataset`` (reused from the terminal harness — it's generic)
-    with integer task indices and ARES group builder thunks.
+    with task objects and ARES group builder thunks.
     """
 
     def __init__(
         self,
         *,
-        preset_name: str,
-        num_tasks: int | None,
+        preset_name: str | None = None,
+        tasks: list[Any] | None = None,
+        num_tasks: int | None = None,
         group_size: int,
         container_factory: containers.ContainerFactory,
         renderer: tinker_env.RendererProtocol | None = None,
@@ -337,7 +402,11 @@ class AresRLDatasetBuilder:
         builder_buffer: int = 0,
         snapshot_template_name: str | None = None,
     ):
+        if preset_name is None and tasks is None:
+            raise ValueError("Either preset_name or tasks must be provided")
+
         self._preset_name = preset_name
+        self._injected_tasks = tasks
         self._num_tasks_limit = num_tasks
         self._group_size = int(group_size)
         self._container_factory = container_factory
@@ -362,7 +431,47 @@ class AresRLDatasetBuilder:
             renderers_mod = importlib.import_module("tinker_cookbook.renderers")
             renderer = renderers_mod.get_renderer(self._renderer_name, tokenizer=tokenizer)
 
-        # Get task count from ARES registry.
+        # Capture closure variables for the thunk.
+        group_size = self._group_size
+        container_factory = self._container_factory
+        max_trajectory_tokens = self._max_trajectory_tokens
+        max_tokens = self._max_tokens
+        snapshot_template_name = self._snapshot_template_name
+
+        if self._injected_tasks is not None:
+            # Task mode: use injected Harbor Task objects directly.
+            task_list: list[Any] = self._injected_tasks
+
+            _LOGGER.info(
+                "AresRLDatasetBuilder: injected tasks=%d, group_size=%d",
+                len(task_list),
+                self._group_size,
+            )
+
+            def task_thunk(task: Any) -> Any:
+                return AresEnvGroupBuilder(
+                    task=task,
+                    group_size=group_size,
+                    renderer=renderer,
+                    container_factory=container_factory,
+                    max_trajectory_tokens=max_trajectory_tokens,
+                    max_tokens=max_tokens,
+                    snapshot_template_name=snapshot_template_name,
+                )
+
+            return (
+                dataset.TerminalRLDataset(
+                    tasks=task_list,
+                    groups_per_batch=self._groups_per_batch,
+                    num_batches=self._num_batches,
+                    group_builder_thunk=task_thunk,
+                    builder_buffer=self._builder_buffer,
+                ),
+                None,
+            )
+
+        # Preset mode: load tasks from ARES registry.
+        assert self._preset_name is not None
         preset_info = ares.info(self._preset_name)
         total_tasks = preset_info.num_tasks
         if self._num_tasks_limit is not None:
@@ -376,17 +485,10 @@ class AresRLDatasetBuilder:
         )
 
         # Use integer task indices as the "task" objects.
-        tasks: list[int] = list(range(total_tasks))
-
-        # Capture closure variables for the thunk.
+        idx_tasks: list[int] = list(range(total_tasks))
         preset_name = self._preset_name
-        group_size = self._group_size
-        container_factory = self._container_factory
-        max_trajectory_tokens = self._max_trajectory_tokens
-        max_tokens = self._max_tokens
-        snapshot_template_name = self._snapshot_template_name
 
-        def thunk(task_idx: Any) -> Any:
+        def idx_thunk(task_idx: Any) -> Any:
             return AresEnvGroupBuilder(
                 preset_name=preset_name,
                 task_idx=int(task_idx),
@@ -400,10 +502,10 @@ class AresRLDatasetBuilder:
 
         return (
             dataset.TerminalRLDataset(
-                tasks=tasks,  # type: ignore[arg-type]
+                tasks=idx_tasks,  # type: ignore[arg-type]
                 groups_per_batch=self._groups_per_batch,
                 num_batches=self._num_batches,
-                group_builder_thunk=thunk,  # type: ignore[arg-type]
+                group_builder_thunk=idx_thunk,  # type: ignore[arg-type]
                 builder_buffer=self._builder_buffer,
             ),
             None,

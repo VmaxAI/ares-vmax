@@ -3,6 +3,7 @@ dm_env Environment protocol and utilities for ARES.
 """
 
 import functools
+import json
 import logging
 import os
 import pathlib
@@ -149,6 +150,40 @@ class Environment[ActionType, ObservationType, RewardType: Scalar, DiscountType:
         await self.close()
 
 
+def _resolve_snapshot_name(
+    template: str,
+    task_name: str,
+    task_dir: pathlib.Path | str | None,
+) -> str:
+    """Resolve a concrete snapshot name, preferring ``entity_info.json`` over template formatting.
+
+    When tasks share a per-repo snapshot (e.g., ``swesmith-meta-chalk__chalk.51557784``),
+    the template ``swesmith-meta-{name}`` resolves incorrectly because ``{name}`` is
+    substituted with the full task name (including entity).  If the task directory
+    contains an ``entity_info.json`` with a ``meta_snapshot_name`` key, that concrete
+    value is used instead.
+    """
+    if task_dir is not None:
+        task_dir_path = pathlib.Path(task_dir)
+        for subdir in ("tests", "environment"):
+            entity_info_path = task_dir_path / subdir / "entity_info.json"
+            if entity_info_path.is_file():
+                try:
+                    info = json.loads(entity_info_path.read_text())
+                    snapshot_name = info.get("meta_snapshot_name")
+                    if snapshot_name:
+                        _LOGGER.debug(
+                            "Resolved snapshot for task=%s from entity_info.json: %s",
+                            task_name,
+                            snapshot_name,
+                        )
+                        return snapshot_name
+                except (json.JSONDecodeError, OSError) as exc:
+                    _LOGGER.debug("Could not read entity_info.json from %s: %s", entity_info_path, exc)
+
+    return template.format(name=task_name)
+
+
 async def create_container(
     *,
     container_factory: containers.ContainerFactory,
@@ -158,6 +193,7 @@ async def create_container(
     resources: containers.Resources | None = None,
     snapshot_template_name: str | None = None,
     task_name: str | None = None,
+    task_dir: pathlib.Path | str | None = None,
 ) -> containers.Container:
     """Create a container from an image, Dockerfile, or snapshot.
 
@@ -171,6 +207,8 @@ async def create_container(
             If set (along with task_name) and the factory supports ``from_snapshot()``,
             the snapshot path is used instead of image/dockerfile.
         task_name: Task name used to format snapshot_template_name.
+        task_dir: Optional task directory. If provided, ``entity_info.json`` is checked
+            for a concrete ``meta_snapshot_name`` before falling back to the template.
 
     Returns:
         A created container (not yet started).
@@ -183,7 +221,7 @@ async def create_container(
 
     # Snapshot path: if template + task_name + factory supports it, use snapshot.
     if snapshot_template_name is not None and task_name is not None and hasattr(container_factory, "from_snapshot"):
-        snapshot_name = snapshot_template_name.format(name=task_name)
+        snapshot_name = _resolve_snapshot_name(snapshot_template_name, task_name, task_dir)
         _LOGGER.info("Using snapshot: %s", snapshot_name)
         container_name = f"ares.{container_prefix}.snap.{timestamp}.{unique_id}"
         return container_factory.from_snapshot(snapshot_name=snapshot_name, name=container_name)  # type: ignore[attr-defined]

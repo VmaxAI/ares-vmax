@@ -95,6 +95,8 @@ class CodeEnvironment(base.Environment[response.LLMResponse, request.LLMRequest 
         self._code_agent_task: asyncio.Task[None] | None = None
         self._step_count = 0
         self._requires_reset = False
+        self._last_test_output: str = ""
+        self._last_meta_results: dict[str, object] = {}
 
         # Register for cleanup on exit.
         _ENVIRONMENT_JANITOR.register_for_cleanup(self)
@@ -267,6 +269,7 @@ class CodeEnvironment(base.Environment[response.LLMResponse, request.LLMRequest 
                 ),
                 snapshot_template_name=self._snapshot_template_name,
                 task_name=self._current_task.name,
+                task_dir=self._current_task.paths.task_dir,
             )
             await self._container.start()
         _LOGGER.debug("[%d] Container setup complete.", id(self))
@@ -329,6 +332,30 @@ class CodeEnvironment(base.Environment[response.LLMResponse, request.LLMRequest 
 
         return 0.0  # Unreachable, but makes the type checker happy.
 
+    @property
+    def last_test_output(self) -> str:
+        """Return the stdout/stderr from the most recent test.sh execution."""
+        return self._last_test_output
+
+    def get_meta_results(self) -> dict[str, object]:
+        """Return the most recent meta_results.json parsed from the container.
+
+        Returns an empty dict if no meta results were found (e.g., non-meta-task).
+        """
+        return self._last_meta_results
+
+    async def _read_meta_results_from_container(self) -> dict[str, object]:
+        """Try to read /logs/verifier/meta_results.json from the container."""
+        if self._container is None:
+            return {}
+        try:
+            result = await self._container.exec_run(command="cat /logs/verifier/meta_results.json")
+            if result.exit_code == 0 and result.output.strip():
+                return json.loads(result.output.strip())
+        except Exception as e:
+            _LOGGER.debug("[%d] Could not read meta_results.json: %s", id(self), e)
+        return {}
+
     async def _compute_reward_inner(self) -> float:
         """Run tests and compute the reward for the current episode."""
         assert self._container is not None
@@ -349,7 +376,11 @@ class CodeEnvironment(base.Environment[response.LLMResponse, request.LLMRequest 
             pathlib.Path("/tests") / self._current_task.paths.test_path.relative_to(self._current_task.paths.tests_dir)
         )
         test_result = await self._container.exec_run(command=f"bash {test_path}")
+        self._last_test_output = test_result.output
         _LOGGER.debug("[%d] Test result: %s.", id(self), test_result.output)
+
+        # Read structured meta-results (written by test.sh for meta-tasks).
+        self._last_meta_results = await self._read_meta_results_from_container()
 
         # Try to read reward from both
         for reward_path in [
