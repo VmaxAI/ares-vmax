@@ -294,6 +294,7 @@ class AresEnvGroupBuilder:
         max_trajectory_tokens: int = 32 * 1024,
         max_tokens: int = 4096,
         snapshot_template_name: str | None = None,
+        code_agent_factory: Any | None = None,
     ):
         if task is None and preset_name is None:
             raise ValueError("Either preset_name or task must be provided")
@@ -310,6 +311,7 @@ class AresEnvGroupBuilder:
         self._max_trajectory_tokens = int(max_trajectory_tokens)
         self._max_tokens = int(max_tokens)
         self._snapshot_template_name = snapshot_template_name
+        self._code_agent_factory = code_agent_factory
 
     async def make_envs(self) -> Sequence[AresCodeTinkerEnv]:
         importlib.import_module("tinker")
@@ -321,11 +323,15 @@ class AresEnvGroupBuilder:
             # Task mode: wrap injected Harbor Task in CodeEnvironment directly.
             task_name = getattr(self._task, "name", "injected-task")
             envs: list[AresCodeTinkerEnv] = []
+            code_agent_kwargs: dict[str, Any] = {}
+            if self._code_agent_factory is not None:
+                code_agent_kwargs["code_agent_factory"] = self._code_agent_factory
             for _ in range(self._group_size):
                 env = code_env.CodeEnvironment(
                     tasks=[self._task],
                     container_factory=self._container_factory,
                     snapshot_template_name=self._snapshot_template_name,
+                    **code_agent_kwargs,
                 )
                 envs.append(
                     AresCodeTinkerEnv(
@@ -401,6 +407,7 @@ class AresRLDatasetBuilder:
         max_tokens: int = 4096,
         builder_buffer: int = 0,
         snapshot_template_name: str | None = None,
+        code_agent_factory: Any | None = None,
     ):
         if preset_name is None and tasks is None:
             raise ValueError("Either preset_name or tasks must be provided")
@@ -419,6 +426,7 @@ class AresRLDatasetBuilder:
         self._max_tokens = int(max_tokens)
         self._builder_buffer = max(0, int(builder_buffer))
         self._snapshot_template_name = snapshot_template_name
+        self._code_agent_factory = code_agent_factory
 
     async def __call__(self) -> tuple[dataset.TerminalRLDataset, None]:
         # Resolve renderer.
@@ -437,6 +445,7 @@ class AresRLDatasetBuilder:
         max_trajectory_tokens = self._max_trajectory_tokens
         max_tokens = self._max_tokens
         snapshot_template_name = self._snapshot_template_name
+        code_agent_factory = self._code_agent_factory
 
         if self._injected_tasks is not None:
             # Task mode: use injected Harbor Task objects directly.
@@ -457,6 +466,7 @@ class AresRLDatasetBuilder:
                     max_trajectory_tokens=max_trajectory_tokens,
                     max_tokens=max_tokens,
                     snapshot_template_name=snapshot_template_name,
+                    code_agent_factory=code_agent_factory,
                 )
 
             return (

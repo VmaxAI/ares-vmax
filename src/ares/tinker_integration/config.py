@@ -70,6 +70,9 @@ class TrainingConfig:
     # Daytona snapshot support (None = use declarative image builds)
     snapshot_template_name: str | None = None
 
+    # Custom code-agent config (None = default swebench.yaml from mini-swe-agent)
+    code_agent_config_path: str | None = None
+
     # Async rollout (None = sync mode, set to e.g. 5 for async)
     max_steps_off_policy: int | None = None
     async_rollout_retries: int = 5

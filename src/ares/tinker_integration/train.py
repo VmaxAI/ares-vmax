@@ -12,6 +12,7 @@ Supports two harness modes via ``config.harness``:
 from __future__ import annotations
 
 import asyncio
+import functools
 import importlib
 import inspect
 import logging
@@ -159,6 +160,16 @@ async def run_training(config: config_mod.TrainingConfig, tasks: list | None = N
     if config.harness == "code-agent":
         # ARES CodeEnvironment harness — wraps ares.make() or injected tasks.
         container_factory = ares_env._get_container_factory(config.env_type)
+
+        # Build a custom code agent factory if a config override is provided.
+        code_agent_factory: Any | None = None
+        if config.code_agent_config_path:
+            from ares.code_agents import mini_swe_agent
+            code_agent_factory = functools.partial(
+                mini_swe_agent.MiniSWECodeAgent, config_path=config.code_agent_config_path
+            )
+            _LOGGER.info("Using custom code-agent config: %s", config.code_agent_config_path)
+
         if tasks is not None:
             # Task-based builder: demiurge-swe injects Harbor Task objects directly.
             _LOGGER.info("Using %d injected tasks with code-agent harness", len(tasks))
@@ -174,6 +185,7 @@ async def run_training(config: config_mod.TrainingConfig, tasks: list | None = N
                 max_tokens=config.max_tokens,
                 builder_buffer=builder_buffer,
                 snapshot_template_name=config.snapshot_template_name,
+                code_agent_factory=code_agent_factory,
             )
         else:
             # Preset-based builder: tasks from ARES registry.
@@ -191,6 +203,7 @@ async def run_training(config: config_mod.TrainingConfig, tasks: list | None = N
                 max_tokens=config.max_tokens,
                 builder_buffer=builder_buffer,
                 snapshot_template_name=config.snapshot_template_name,
+                code_agent_factory=code_agent_factory,
             )
     else:
         # Terminal harness (default) — tmux + JSON commands.

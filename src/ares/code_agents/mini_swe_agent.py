@@ -35,6 +35,9 @@ import minisweagent.config
 
 _LOGGER = logging.getLogger(__name__)
 
+# Bundled config directory for custom agent configs (e.g., meta_task.yaml).
+CONFIGS_DIR = pathlib.Path(__file__).parent / "configs"
+
 
 # Copied from minisweagent's default config.
 _TIMEOUT_TEMPLATE = """
@@ -116,9 +119,13 @@ class MiniSWECodeAgent(code_agent_base.CodeAgent):
     container: containers.Container
     llm_client: llm_clients.LLMClient
     tracker: stat_tracker.StatTracker = dataclasses.field(default_factory=stat_tracker.NullStatTracker)
+    config_path: str | None = None
 
     def __post_init__(self):
-        config_path = pathlib.Path(minisweagent.config.builtin_config_dir) / "benchmarks" / "swebench.yaml"
+        if self.config_path is not None:
+            config_path = pathlib.Path(self.config_path)
+        else:
+            config_path = pathlib.Path(minisweagent.config.builtin_config_dir) / "benchmarks" / "swebench.yaml"
         self._config = yaml.safe_load(config_path.read_text())
         self._agent_config = self._config.get("agent", {})
         self._model_config = self._config.get("model", {})
@@ -133,7 +140,7 @@ class MiniSWECodeAgent(code_agent_base.CodeAgent):
         filtered = {k: v for k, v in agent_config_dict.items() if k in valid_fields}
         for k in set(agent_config_dict) - valid_fields:
             _LOGGER.info("Ignoring argument %s in agent configuration.", k)
-        agent_config = default_agent.AgentConfig(**filtered)
+        default_agent.AgentConfig(**filtered)  # Validate config is well-formed.
 
         # Initialize step and cost tracking
         self._n_calls = 0
@@ -267,7 +274,9 @@ class MiniSWECodeAgent(code_agent_base.CodeAgent):
             error_detail = "No bash code block found in response. Wrap your command in ```bash\\n...\\n```."
         else:
             error_detail = f"Expected exactly 1 bash code block, found {len(actions)}. Combine into a single block."
-        format_error_str = _render_format_error_template(self._model_config["format_error_template"], error=error_detail)
+        format_error_str = _render_format_error_template(
+            self._model_config["format_error_template"], error=error_detail
+        )
         raise _FormatError(format_error_str)
 
     def _raise_if_finished(self, output: containers.ExecResult):

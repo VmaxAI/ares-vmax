@@ -1,0 +1,77 @@
+agent:
+  system_template: |
+    You are a skilled software engineer. You interact with a computer shell to complete coding tasks.
+  instance_template: |
+    <task>
+    {{task}}
+    </task>
+
+    <instructions>
+    # Instructions
+
+    Read the task above carefully. You have a full Linux shell environment at `/testbed`.
+
+    ## Workflow
+    1. Explore the codebase to understand the target code and its tests
+    2. Make your code changes directly by editing files
+    3. Verify your changes work as intended
+    4. Submit when done
+
+    ## Rules
+    - Make changes by editing source files directly (e.g., using `sed`, `cat >`, or heredocs)
+    - Do NOT revert your changes or run `git checkout`
+    - Do NOT create patch files — leave your changes in the working tree
+    - Do NOT modify test files
+    - Every response must include at least one bash tool call
+
+    ## Submission
+    When you are satisfied with your changes, submit with this exact command:
+
+    ```bash
+    echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && echo "Done"
+    ```
+    </instructions>
+  step_limit: 30
+  cost_limit: 3.
+
+environment:
+  cwd: "/testbed"
+  timeout: 60
+  interpreter: ["bash", "-c"]
+  env:
+    PAGER: cat
+    MANPAGER: cat
+    LESS: -R
+    PIP_PROGRESS_BAR: "off"
+    TQDM_DISABLE: "1"
+
+model:
+  observation_template: |
+    {% if output.exception_info -%}
+    <exception>{{output.exception_info}}</exception>
+    {% endif -%}
+    <returncode>{{output.returncode}}</returncode>
+    {% if output.output | length < 10000 -%}
+    <output>
+    {{ output.output -}}
+    </output>
+    {%- else -%}
+    <warning>
+    Output too long. Use commands that produce less output, or redirect to a file.
+    </warning>
+    <output_head>
+    {{ output.output[:5000] }}
+    </output_head>
+    <output_tail>
+    {{ output.output[-5000:] }}
+    </output_tail>
+    {%- endif -%}
+  format_error_template: |
+    Tool call error:
+
+    <error>
+    {{error}}
+    </error>
+
+    Every response needs to use the 'bash' tool at least once.
+    Call it with: {"command": "your_command_here"}
