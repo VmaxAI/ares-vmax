@@ -117,7 +117,7 @@ class MiniSWECodeAgent(code_agent_base.CodeAgent):
     tracker: stat_tracker.StatTracker = dataclasses.field(default_factory=stat_tracker.NullStatTracker)
 
     def __post_init__(self):
-        config_path = pathlib.Path(minisweagent.config.builtin_config_dir) / "extra" / "swebench.yaml"
+        config_path = pathlib.Path(minisweagent.config.builtin_config_dir) / "benchmarks" / "swebench.yaml"
         self._config = yaml.safe_load(config_path.read_text())
         self._agent_config = self._config.get("agent", {})
 
