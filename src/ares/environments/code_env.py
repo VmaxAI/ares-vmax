@@ -73,6 +73,7 @@ class CodeEnvironment(base.Environment[response.LLMResponse, request.LLMRequest 
         prefix: str = "harbor_env",
         tracker: stat_tracker.StatTracker | None = None,
         snapshot_template_name: str | None = None,
+        env: dict[str, str] | None = None,
     ):
         self._tasks = tasks
         self._container_factory = container_factory
@@ -81,6 +82,7 @@ class CodeEnvironment(base.Environment[response.LLMResponse, request.LLMRequest 
         self._prefix = prefix
         self._tracker = tracker if tracker is not None else stat_tracker.NullStatTracker()
         self._snapshot_template_name = snapshot_template_name
+        self._env = env
 
         # We set the LLM client to a queue mediated client so that
         # we can return LLM requests in the reset and step methods.
@@ -272,7 +274,7 @@ class CodeEnvironment(base.Environment[response.LLMResponse, request.LLMRequest 
                 task_name=self._current_task.name,
                 task_dir=self._current_task.paths.task_dir,
             )
-            await self._container.start()
+            await self._container.start(env=self._env)
         _LOGGER.debug("[%d] Container setup complete.", id(self))
 
     async def _start_code_agent(self) -> None:

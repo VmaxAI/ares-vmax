@@ -295,6 +295,7 @@ class AresEnvGroupBuilder:
         max_tokens: int = 4096,
         snapshot_template_name: str | None = None,
         code_agent_factory: Any | None = None,
+        sandbox_env: dict[str, str] | None = None,
     ):
         if task is None and preset_name is None:
             raise ValueError("Either preset_name or task must be provided")
@@ -312,6 +313,7 @@ class AresEnvGroupBuilder:
         self._max_tokens = int(max_tokens)
         self._snapshot_template_name = snapshot_template_name
         self._code_agent_factory = code_agent_factory
+        self._sandbox_env = sandbox_env
 
     async def make_envs(self) -> Sequence[AresCodeTinkerEnv]:
         importlib.import_module("tinker")
@@ -326,6 +328,8 @@ class AresEnvGroupBuilder:
             code_agent_kwargs: dict[str, Any] = {}
             if self._code_agent_factory is not None:
                 code_agent_kwargs["code_agent_factory"] = self._code_agent_factory
+            if self._sandbox_env is not None:
+                code_agent_kwargs["env"] = self._sandbox_env
             for _ in range(self._group_size):
                 env = code_env.CodeEnvironment(
                     tasks=[self._task],
@@ -408,6 +412,7 @@ class AresRLDatasetBuilder:
         builder_buffer: int = 0,
         snapshot_template_name: str | None = None,
         code_agent_factory: Any | None = None,
+        sandbox_env: dict[str, str] | None = None,
     ):
         if preset_name is None and tasks is None:
             raise ValueError("Either preset_name or tasks must be provided")
@@ -427,6 +432,7 @@ class AresRLDatasetBuilder:
         self._builder_buffer = max(0, int(builder_buffer))
         self._snapshot_template_name = snapshot_template_name
         self._code_agent_factory = code_agent_factory
+        self._sandbox_env = sandbox_env
 
     async def __call__(self) -> tuple[dataset.TerminalRLDataset, None]:
         # Resolve renderer.
@@ -446,6 +452,7 @@ class AresRLDatasetBuilder:
         max_tokens = self._max_tokens
         snapshot_template_name = self._snapshot_template_name
         code_agent_factory = self._code_agent_factory
+        sandbox_env = self._sandbox_env
 
         if self._injected_tasks is not None:
             # Task mode: use injected Harbor Task objects directly.
@@ -467,6 +474,7 @@ class AresRLDatasetBuilder:
                     max_tokens=max_tokens,
                     snapshot_template_name=snapshot_template_name,
                     code_agent_factory=code_agent_factory,
+                    sandbox_env=sandbox_env,
                 )
 
             return (

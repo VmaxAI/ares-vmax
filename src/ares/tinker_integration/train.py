@@ -170,6 +170,24 @@ async def run_training(config: config_mod.TrainingConfig, tasks: list | None = N
             )
             _LOGGER.info("Using custom code-agent config: %s", config.code_agent_config_path)
 
+        # Collect API keys from host environment to pass into sandboxes.
+        # These are needed by test.sh scripts (create_inner_task.py for issue
+        # generation, run_inner_agent.py for frontier model trials).
+        sandbox_env_keys = [
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "DAYTONA_API_KEY",
+            "DAYTONA_API_URL",
+            "CHAT_COMPLETION_API_KEY",
+            "CHAT_COMPLETION_BASE_URL",
+            "HF_TOKEN",
+        ]
+        sandbox_env: dict[str, str] = {k: v for k in sandbox_env_keys if (v := os.environ.get(k))}
+        if sandbox_env:
+            _LOGGER.info("Passing %d env vars to sandboxes: %s", len(sandbox_env), list(sandbox_env.keys()))
+        else:
+            _LOGGER.warning("No API keys found in host environment — sandbox scripts may fail")
+
         if tasks is not None:
             # Task-based builder: demiurge-swe injects Harbor Task objects directly.
             _LOGGER.info("Using %d injected tasks with code-agent harness", len(tasks))
@@ -186,6 +204,7 @@ async def run_training(config: config_mod.TrainingConfig, tasks: list | None = N
                 builder_buffer=builder_buffer,
                 snapshot_template_name=config.snapshot_template_name,
                 code_agent_factory=code_agent_factory,
+                sandbox_env=sandbox_env or None,
             )
         else:
             # Preset-based builder: tasks from ARES registry.
@@ -204,6 +223,7 @@ async def run_training(config: config_mod.TrainingConfig, tasks: list | None = N
                 builder_buffer=builder_buffer,
                 snapshot_template_name=config.snapshot_template_name,
                 code_agent_factory=code_agent_factory,
+                sandbox_env=sandbox_env or None,
             )
     else:
         # Terminal harness (default) — tmux + JSON commands.
