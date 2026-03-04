@@ -99,9 +99,9 @@ def _render_action_observation_template(action_observation_template: str, output
     )
 
 
-def _render_format_error_template(format_error_template: str, actions: list[str]) -> str:
+def _render_format_error_template(format_error_template: str, error: str) -> str:
     return jinja2.Template(format_error_template, undefined=jinja2.StrictUndefined).render(
-        actions=actions,
+        error=error,
     )
 
 
@@ -262,7 +262,11 @@ class MiniSWECodeAgent(code_agent_base.CodeAgent):
         if len(actions) == 1:
             return actions[0].strip()
 
-        format_error_str = _render_format_error_template(self._model_config["format_error_template"], actions=actions)
+        if len(actions) == 0:
+            error_detail = "No bash code block found in response. Wrap your command in ```bash\\n...\\n```."
+        else:
+            error_detail = f"Expected exactly 1 bash code block, found {len(actions)}. Combine into a single block."
+        format_error_str = _render_format_error_template(self._model_config["format_error_template"], error=error_detail)
         raise _FormatError(format_error_str)
 
     def _raise_if_finished(self, output: containers.ExecResult):
