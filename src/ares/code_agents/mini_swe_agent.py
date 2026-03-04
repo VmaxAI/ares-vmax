@@ -120,6 +120,7 @@ class MiniSWECodeAgent(code_agent_base.CodeAgent):
         config_path = pathlib.Path(minisweagent.config.builtin_config_dir) / "benchmarks" / "swebench.yaml"
         self._config = yaml.safe_load(config_path.read_text())
         self._agent_config = self._config.get("agent", {})
+        self._model_config = self._config.get("model", {})
 
         environment_config = self._config.get("environment", {})
         self._env_timeout = environment_config.get("timeout", None)
@@ -250,7 +251,7 @@ class MiniSWECodeAgent(code_agent_base.CodeAgent):
         self._raise_if_finished(output)
 
         observation = _render_action_observation_template(
-            self._agent_config["action_observation_template"],
+            self._model_config["observation_template"],
             output=_MiniSWEAgentOutput(returncode=output.exit_code, output=output.output),
         )
         self._add_message("user", observation)
@@ -261,7 +262,7 @@ class MiniSWECodeAgent(code_agent_base.CodeAgent):
         if len(actions) == 1:
             return actions[0].strip()
 
-        format_error_str = _render_format_error_template(self._agent_config["format_error_template"], actions=actions)
+        format_error_str = _render_format_error_template(self._model_config["format_error_template"], actions=actions)
         raise _FormatError(format_error_str)
 
     def _raise_if_finished(self, output: containers.ExecResult):
