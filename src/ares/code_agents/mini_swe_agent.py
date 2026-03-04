@@ -125,15 +125,13 @@ class MiniSWECodeAgent(code_agent_base.CodeAgent):
         self._env_timeout = environment_config.get("timeout", None)
         self._environment_env_vars = environment_config.get("env", None)
 
-        # Somewhat frustratingly, minisweagent uses kwargs.
-        # We handle this by inspecting whether an argument will be accepted by the agent config.
+        # Filter agent config dict to only include fields recognized by AgentConfig.
         agent_config_dict = self._config.get("agent", {})
-        agent_config = default_agent.AgentConfig()
-        for k, v in agent_config_dict.items():
-            if hasattr(default_agent.AgentConfig, k):
-                setattr(agent_config, k, v)
-            else:
-                _LOGGER.info("Ignoring argument %s in agent configuration.", k)
+        valid_fields = set(default_agent.AgentConfig.model_fields)
+        filtered = {k: v for k, v in agent_config_dict.items() if k in valid_fields}
+        for k in set(agent_config_dict) - valid_fields:
+            _LOGGER.info("Ignoring argument %s in agent configuration.", k)
+        agent_config = default_agent.AgentConfig(**filtered)
 
         # Initialize step and cost tracking
         self._n_calls = 0
