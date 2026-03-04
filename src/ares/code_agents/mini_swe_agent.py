@@ -75,6 +75,7 @@ class _LimitsExceededError(_TerminatingError):
 class _MiniSWEAgentOutput:
     returncode: int
     output: str
+    exception_info: str | None = None
 
 
 def _render_system_template(system_template: str) -> str:
