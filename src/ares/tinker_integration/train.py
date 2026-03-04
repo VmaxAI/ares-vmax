@@ -327,13 +327,16 @@ async def run_training(config: config_mod.TrainingConfig, tasks: list | None = N
                 if attempt < rollout_max_retries:
                     delay = min(10.0 * (2 ** (attempt - 1)), 120.0)
                     delay *= 0.5 + random.random()  # jitter
+                    cause = e.__cause__ or e.__context__
+                    cause_msg = f" | caused by {type(cause).__name__}: {cause}" if cause else ""
                     _LOGGER.warning(
-                        "Group rollout failed (attempt %d/%d), retrying in %.0fs: %s: %s",
+                        "Group rollout failed (attempt %d/%d), retrying in %.0fs: %s: %s%s",
                         attempt,
                         rollout_max_retries,
                         delay,
                         type(e).__name__,
                         e,
+                        cause_msg,
                     )
                     await asyncio.sleep(delay)
                 else:

@@ -186,6 +186,7 @@ class CodeEnvironment(base.Environment[response.LLMResponse, request.LLMRequest 
             assert self._code_agent_task is not None
             exc = self._code_agent_task.exception()
             if exc is not None:
+                _LOGGER.error("[%d] Code agent raised %s: %s", id(self), type(exc).__name__, exc)
                 raise RuntimeError("Code agent task failed") from exc
 
             # We're done. Return the final reward.
