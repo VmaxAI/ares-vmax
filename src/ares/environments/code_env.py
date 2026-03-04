@@ -385,6 +385,17 @@ class CodeEnvironment(base.Environment[response.LLMResponse, request.LLMRequest 
         # Read structured meta-results (written by test.sh for meta-tasks).
         self._last_meta_results = await self._read_meta_results_from_container()
 
+        # Log test.sh output at WARNING level when there's a failure reason,
+        # so operators can see exactly why the episode failed (e.g., inner_task_creation_failed).
+        failure_reason = self._last_meta_results.get("failure_reason")
+        if failure_reason:
+            _LOGGER.warning(
+                "[%d] test.sh failure_reason=%s | output:\n%s",
+                id(self),
+                failure_reason,
+                test_result.output[-2000:] if len(test_result.output) > 2000 else test_result.output,
+            )
+
         # Try to read reward from both
         for reward_path in [
             harbor_paths.EnvironmentPaths.reward_text_path,
