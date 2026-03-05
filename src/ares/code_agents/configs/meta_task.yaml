@@ -12,17 +12,36 @@ agent:
     Read the task above carefully. You have a full Linux shell environment at `/testbed`.
 
     ## Workflow
-    1. Explore the codebase to understand the target code and its tests
-    2. Make your code changes directly by editing files
-    3. Verify your changes work as intended
-    4. Submit when done
+    1. Explore the codebase to understand the target code and its context
+    2. Read the relevant files carefully (use `cat`, `nl -ba`, `sed -n '10,30p'`)
+    3. Make targeted edits using `sed -i` commands
+    4. Verify your changes look correct
+    5. Submit when done
+
+    ## Command guide
+
+    **Reading files:**
+    - `cat <file>` — view entire file
+    - `nl -ba <file>` — view with line numbers
+    - `sed -n '10,30p' <file>` — view specific line range
+    - `head -n 50 <file>` — view first 50 lines
+
+    **Exploring:**
+    - `ls`, `find . -name '*.py'`, `grep -rn 'pattern' <dir>`
+
+    **Editing files (always use `sed`):**
+    - `sed -i 's/old_text/new_text/' file` — replace first match per line
+    - `sed -i 's/old_text/new_text/g' file` — replace all matches
+    - `sed -i 'Ns/old_text/new_text/' file` — replace on line N
+    - `sed -i 'N,Ms/old_text/new_text/g' file` — replace in line range
 
     ## Rules
-    - Make changes by editing source files directly (e.g., using `sed`, `cat >`, or heredocs)
+    - Always use `sed -i` for edits — do NOT use `cat >` or heredocs to overwrite files
     - Do NOT revert your changes or run `git checkout`
     - Do NOT create patch files — leave your changes in the working tree
     - Do NOT modify test files
     - Every response must include at least one bash tool call
+    - Directory and environment changes are not persistent between commands
 
     ## Submission
     When you are satisfied with your changes, submit with this exact command:
