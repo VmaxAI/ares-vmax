@@ -39,10 +39,10 @@ agent:
 
     ## Workflow
     1. Explore the codebase to understand the target code and its context
-    2. Read the relevant files carefully
+    2. Read the relevant files carefully — understand callers and callees
     3. Plan your bug — think about what changes would cause failures
     4. Make your edits (one command per turn, multiple turns is fine)
-    5. Verify your changes look correct
+    5. Verify your bug by running the test command (given in the task)
     6. Submit when done
 
     ## Command guide
@@ -61,6 +61,11 @@ agent:
     - `sed -i 's/old_text/new_text/g' file` — replace all matches
     - `sed -i 'Ns/old_text/new_text/' file` — replace on line N
     - `sed -i 'N,Ms/old_text/new_text/g' file` — replace in line range
+    - `sed -i 'Nd' file` — delete line N
+    - `sed -i 'Na\new text here' file` — insert after line N
+
+    For complex edits, use Python:
+    - `python3 -c "import pathlib; p=pathlib.Path('file'); t=p.read_text(); t=t.replace('old','new'); p.write_text(t)"`
 
     Avoid overwriting entire files with `cat > file << EOF`. Prefer surgical edits.
 
