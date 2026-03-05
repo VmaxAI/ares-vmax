@@ -86,9 +86,9 @@ agent:
     - Directory and environment changes are not persistent between commands
 
     ## Submission
-    ONLY submit after you have run the test command and confirmed at least one test fails.
-    If all tests pass, do NOT submit — try a different bug instead.
-    Submitting without test failures results in a negative reward.
+    Your bug must cause at least one test to fail — bugs that don't break tests receive
+    a negative reward. If you've verified that tests still pass, try a different bug.
+    When ready, submit with:
 
     ```bash
     echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && echo "Done"
