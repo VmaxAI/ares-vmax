@@ -32,6 +32,7 @@ from ares.tinker_integration.opsd import distillation
 from ares.tinker_integration.opsd import evaluation as eval_mod
 from ares.tinker_integration.opsd import privileged_env
 from ares.tinker_integration.opsd import reflection as reflection_mod
+from ares.tinker_integration.opsd import trajectory_logging as traj_log
 from ares.tinker_integration.rl import train as rl_train_mod
 
 _LOGGER = logging.getLogger(__name__)
@@ -265,6 +266,8 @@ async def _run_distillation_steps(
     ml_logger: Any,
     global_batch: int,
     distill_buffer: list[dict[str, Any]] | None = None,
+    *,
+    cycle: int = 0,
 ) -> tuple[Any, int]:
     """Run distillation gradient steps on ALL distillable tasks.
 
@@ -353,6 +356,8 @@ async def _run_distillation_steps(
         sampling_client,
         renderer,
         config,
+        log_path=config.log_path,
+        cycle=cycle,
     )
 
     rollout_time = time.time() - t_rollout
@@ -459,6 +464,8 @@ async def _run_opsd_phases(
     global_batch: int,
     distill_buffer: list[dict[str, Any]] | None = None,
     reflection_cache: dict[str, tuple[str, int]] | None = None,
+    *,
+    cycle: int = 0,
 ) -> tuple[Any, int]:
     """Run OPSD phases: (RL results as eval) → reflect → teacher → filter → distill.
 
@@ -539,6 +546,8 @@ async def _run_opsd_phases(
             config,
             renderer,
             tokenizer,
+            log_path=config.log_path,
+            cycle=cycle,
         )
         # Store in cache.
         if reflection_cache is not None:
@@ -618,9 +627,25 @@ async def _run_opsd_phases(
         ml_logger,
         global_batch,
         distill_buffer=distill_buffer,
+        cycle=cycle,
     )
 
     _save_opsd_state(config.log_path, "distill_done", global_batch)
+
+    # Save ATIF cycle summary.
+    teacher_solved_names = [tr.task_name for tr in teacher_result.task_results if not tr.all_failed]
+    distillable_names = [sr.task_name for sr, _ in distillable]
+    traj_log.save_cycle_summary(
+        config.log_path,
+        cycle,
+        hard_task_names=[r.task_name for r in hard_tasks],
+        reflection_tasks_generated=[r.task_name for r in tasks_needing_reflection],
+        reflection_tasks_cached=[
+            r.task_name for r in hard_tasks if r.task_name not in {t.task_name for t in tasks_needing_reflection}
+        ],
+        teacher_solved=teacher_solved_names,
+        distillable_tasks=distillable_names,
+    )
 
     # Save post-OPSD checkpoint.
     await checkpoint_utils.save_checkpoint_async(
@@ -746,6 +771,9 @@ async def run_opsd_training(config: opsd_config_mod.OPSDConfig) -> None:
     # tasks across consecutive OPSD cycles.  Maps task_name → (text, age).
     reflection_cache: dict[str, tuple[str, int]] = {}
 
+    # OPSD cycle counter (for ATIF trajectory logging).
+    opsd_cycle = 0
+
     _LOGGER.info(
         "Starting OPSD training: harness=%s, model=%s, tasks=%d, num_batches=%d, opsd_every=%d",
         config.harness,
@@ -803,7 +831,7 @@ async def run_opsd_training(config: opsd_config_mod.OPSDConfig) -> None:
             # OPSD phases every N batches — uses RL batch results as student
             # eval (no separate evaluation on all tasks).
             if (batch_idx + 1) % config.opsd_every == 0:
-                _LOGGER.info("========== OPSD PHASES after batch %d ==========", batch_idx + 1)
+                _LOGGER.info("========== OPSD PHASES after batch %d (cycle %d) ==========", batch_idx + 1, opsd_cycle)
                 sampling_client, global_batch = await _run_opsd_phases(
                     config,
                     training_client,
@@ -815,7 +843,9 @@ async def run_opsd_training(config: opsd_config_mod.OPSDConfig) -> None:
                     global_batch,
                     distill_buffer=distill_buffer,
                     reflection_cache=reflection_cache,
+                    cycle=opsd_cycle,
                 )
+                opsd_cycle += 1
 
     # Save final checkpoint.
     await checkpoint_utils.save_checkpoint_async(

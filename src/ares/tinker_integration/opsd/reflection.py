@@ -18,23 +18,38 @@ import tinker
 
 from ares.tinker_integration.opsd import config as opsd_config_mod
 from ares.tinker_integration.opsd import evaluation as eval_mod
+from ares.tinker_integration.opsd import trajectory_logging as traj_log
 
 _LOGGER = logging.getLogger(__name__)
 
+_REFLECTION_SYSTEM_MESSAGE = """\
+You are an expert code reviewer writing a structured analysis document. \
+You do NOT write code, bash commands, or interact with any environment. \
+You do NOT role-play as an agent or continue any interaction transcript. \
+Your ONLY job is to produce a thorough written analysis of failed attempts."""
+
 _REFLECTION_PROMPT_TEMPLATE = """\
-You are an expert software engineer analyzing failed attempts to solve a \
-software engineering task. Your analysis will be injected as privileged \
-information into a future attempt by the same model, so be maximally \
-thorough — the more detail you provide, the higher the chance of success.
+Below is a software engineering task followed by interaction traces from \
+multiple failed attempts at solving it. All attempts share the same task \
+description (shown once). The traces show only each attempt's unique \
+interaction: the model's responses and the environment's outputs.
+
+Write a structured analysis document that will be injected as privileged \
+information into a future attempt. Be maximally thorough.
+
+IMPORTANT: You are a REVIEWER, not the agent. Do NOT generate bash commands, \
+code blocks, or THOUGHT sections. Write ONLY the analysis sections below.
 
 ## Task Description
 {task_instruction}
 
-## Failed Attempts
+## Failed Attempt Traces
 {trace_sections}
 
-Write an extremely detailed analysis. Cover EVERY section below thoroughly. \
-Do NOT abbreviate — length and specificity are critical.
+---
+
+Produce your analysis covering EVERY section below. Do NOT abbreviate — \
+length and specificity are critical.
 
 ### 1. Problem Distillation
 Restate the core problem in your own words. What exactly needs to change? \
@@ -84,8 +99,25 @@ Be exhaustive. Write as much as you can. Every specific detail you include \
 increases the probability of success on the next attempt."""
 
 _TRACE_SECTION_TEMPLATE = """\
-## Failed Attempt {attempt_num}
+### Failed Attempt {attempt_num}
 {condensed_trace}"""
+
+
+def _get_action_tokens(action: Any) -> list[int]:
+    """Extract token list from an action object (TokensWithLogprobs)."""
+    tokens = getattr(action, "tokens", None)
+    if tokens:
+        return list(tokens)
+    if hasattr(action, "to_ints"):
+        return list(action.to_ints())
+    return []
+
+
+def _get_obs_tokens(obs: Any) -> list[int]:
+    """Extract token list from an observation object (ModelInput)."""
+    if obs is not None and hasattr(obs, "to_ints"):
+        return list(obs.to_ints())
+    return []
 
 
 def _extract_condensed_trace(
@@ -93,68 +125,83 @@ def _extract_condensed_trace(
     tokenizer: Any,
     max_tokens: int,
 ) -> str:
-    """Extract a condensed trace from a trajectory.
+    """Extract a condensed, deduplicated trace from a trajectory.
 
-    Focuses on the last 2-3 turns (commands + outputs/tracebacks) to keep
-    within context budget. Falls back to raw token decoding if message
-    extraction isn't available.
+    Instead of dumping raw observations (which contain the full accumulated
+    context including the system prompt), this extracts only the *delta* at
+    each step: the model's response and the new environment output.  The
+    system prompt / task description is shown once at the top of the
+    reflection prompt, so it is NOT repeated inside each trace.
     """
-    # Try extracting text from trajectory transitions.
     transitions = getattr(trajectory, "transitions", [])
     if not transitions:
-        # Fallback: decode the full trajectory token sequence.
         try:
             all_tokens = trajectory.model_input.to_ints()
             text = tokenizer.decode(all_tokens[-max_tokens:])
-            return text[: max_tokens * 4]  # rough char estimate
+            return text[: max_tokens * 4]
         except Exception:
             return "(unable to extract trace)"
 
-    # Take the last several transitions for richer context.  We include more
-    # turns than strictly necessary because error patterns often span multiple
-    # steps (e.g. the model edits a file, runs tests, sees an error, tries a
-    # different fix, sees a different error).
-    last_transitions = transitions[-6:]
+    # Show the last N steps of the interaction.
+    window_size = 6
+    start_idx = max(0, len(transitions) - window_size)
+    window = transitions[start_idx:]
+
+    # We need the transition just before the window to compute the first
+    # delta (new env output = obs[i] minus prev_obs + prev_action).
+    prev_transition = transitions[start_idx - 1] if start_idx > 0 else None
+
     parts: list[str] = []
+    per_step_tokens = max(max_tokens // max(len(window), 1), 256)
 
-    # Budget per transition: split max_tokens across all transitions.
-    per_transition_tokens = max(max_tokens // max(len(last_transitions), 1), 512)
-
-    for t in last_transitions:
-        # Transition fields: ob (ModelInput), ac (TokensWithLogprobs).
-        obs_text = ""
+    for step_idx, t in enumerate(window):
+        # --- Model response (action tokens — always unique per step) ---
         action_text = ""
-
-        # Decode observation (ModelInput with .to_ints()).
-        obs = getattr(t, "ob", None)
-        if obs is not None:
-            try:
-                obs_tokens = obs.to_ints() if hasattr(obs, "to_ints") else []
-                if obs_tokens:
-                    obs_text = tokenizer.decode(obs_tokens[-per_transition_tokens:])
-            except Exception:
-                pass
-
-        # Decode action (TokensWithLogprobs with .tokens list).
         action = getattr(t, "ac", None)
         if action is not None:
             try:
-                action_tokens = getattr(action, "tokens", None)
-                if action_tokens:
-                    action_text = tokenizer.decode(action_tokens)
-                elif hasattr(action, "to_ints"):
-                    action_text = tokenizer.decode(action.to_ints())
+                ac_tokens = _get_action_tokens(action)
+                if ac_tokens:
+                    action_text = tokenizer.decode(ac_tokens[-per_step_tokens:])
             except Exception:
                 pass
 
-        if obs_text:
-            parts.append(f"[Observation]\n{obs_text}")
+        # --- Environment output delta ---
+        # For the first transition of the entire trajectory there is no
+        # previous step — the observation is just the task prompt (already
+        # shown at the top), so we skip the env output.
+        env_output_text = ""
+        prev_t = prev_transition if step_idx == 0 else window[step_idx - 1]
+
+        if prev_t is not None:
+            obs = getattr(t, "ob", None)
+            prev_obs = getattr(prev_t, "ob", None)
+            prev_ac = getattr(prev_t, "ac", None)
+            try:
+                obs_tokens = _get_obs_tokens(obs)
+                prev_obs_tokens = _get_obs_tokens(prev_obs)
+                prev_ac_tokens = _get_action_tokens(prev_ac) if prev_ac is not None else []
+                delta_start = len(prev_obs_tokens) + len(prev_ac_tokens)
+                if delta_start < len(obs_tokens):
+                    delta_tokens = obs_tokens[delta_start : delta_start + per_step_tokens]
+                    if delta_tokens:
+                        env_output_text = tokenizer.decode(delta_tokens)
+            except Exception:
+                pass
+
+        # --- Assemble step ---
+        step_parts: list[str] = []
+        if env_output_text:
+            step_parts.append(f"**Environment Output:**\n{env_output_text}")
         if action_text:
-            parts.append(f"[Action]\n{action_text}")
+            step_parts.append(f"**Model Response:**\n{action_text}")
+
+        if step_parts:
+            parts.append(f"#### Step {step_idx + 1}\n" + "\n\n".join(step_parts))
 
     result = "\n\n".join(parts)
 
-    # Truncate to max_tokens worth of characters (rough 4:1 char:token ratio).
+    # Final length guard (rough 4:1 char-to-token ratio).
     max_chars = max_tokens * 4
     if len(result) > max_chars:
         result = result[-max_chars:]
@@ -226,11 +273,23 @@ async def _generate_single_reflection(
     tokenizer: Any,
     renderer: Any,
     config: opsd_config_mod.OPSDConfig,
+    *,
+    log_path: str | None = None,
+    cycle: int = 0,
 ) -> tuple[str, str | None]:
     """Generate reflection for a single task. Returns (task_name, reflection_text)."""
     prompt = build_reflection_prompt(task_result, tokenizer, config)
 
-    messages = [{"role": "user", "content": prompt}]
+    # Save reflection input (ATIF).
+    if log_path:
+        traj_log.save_reflection_input(
+            log_path, cycle, task_result.task_name, prompt, system_message=_REFLECTION_SYSTEM_MESSAGE
+        )
+
+    messages = [
+        {"role": "system", "content": _REFLECTION_SYSTEM_MESSAGE},
+        {"role": "user", "content": prompt},
+    ]
     model_input = renderer.build_generation_prompt(messages)
 
     try:
@@ -248,12 +307,27 @@ async def _generate_single_reflection(
         response_tokens = result.sequences[0].tokens if result.sequences else []
         reflection_text = tokenizer.decode(response_tokens) if response_tokens else str(result)
 
+        prompt_tok_count = model_input.length
+        reflection_tok_count = len(response_tokens) if response_tokens else 0
+
         _LOGGER.info(
             "REFLECTION | task=%s | prompt_tokens=%d | reflection_tokens=%d",
             task_result.task_name,
-            model_input.length,
-            len(response_tokens) if response_tokens else 0,
+            prompt_tok_count,
+            reflection_tok_count,
         )
+
+        # Save reflection output (ATIF).
+        if log_path:
+            traj_log.save_reflection_output(
+                log_path,
+                cycle,
+                task_result.task_name,
+                reflection_text,
+                prompt_tokens=prompt_tok_count,
+                reflection_tokens=reflection_tok_count,
+            )
+
         return task_result.task_name, reflection_text
 
     except Exception as exc:
@@ -272,6 +346,9 @@ async def generate_reflections(
     config: opsd_config_mod.OPSDConfig,
     renderer: Any,
     tokenizer: Any,
+    *,
+    log_path: str | None = None,
+    cycle: int = 0,
 ) -> dict[str, str]:
     """Generate self-reflections for all hard tasks concurrently.
 
@@ -281,6 +358,8 @@ async def generate_reflections(
         config: OPSD configuration.
         renderer: Tinker renderer for building prompts.
         tokenizer: Tokenizer for decoding trajectories and tokens.
+        log_path: If set, save ATIF trajectory files under this directory.
+        cycle: OPSD cycle number (for ATIF filenames).
 
     Returns:
         Mapping of task_name -> reflection_text for tasks with successful generation.
@@ -288,7 +367,15 @@ async def generate_reflections(
     _LOGGER.info("=== REFLECTION PHASE | generating reflections for %d hard tasks ===", len(hard_tasks))
 
     coros = [
-        _generate_single_reflection(sampling_client, task_result, tokenizer, renderer, config)
+        _generate_single_reflection(
+            sampling_client,
+            task_result,
+            tokenizer,
+            renderer,
+            config,
+            log_path=log_path,
+            cycle=cycle,
+        )
         for task_result in hard_tasks
     ]
     results = await asyncio.gather(*coros)

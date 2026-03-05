@@ -16,6 +16,7 @@ import logging
 from typing import Any, cast
 
 from ares.tinker_integration.opsd import config as opsd_config_mod
+from ares.tinker_integration.opsd import trajectory_logging as traj_log
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -106,6 +107,9 @@ async def incorporate_teacher_kl(
     sampling_client: Any,
     renderer: Any,
     config: opsd_config_mod.OPSDConfig,
+    *,
+    log_path: str | None = None,
+    cycle: int = 0,
 ) -> dict[str, float]:
     """Compute reverse KL between student and teacher, adjusting advantages.
 
@@ -119,11 +123,24 @@ async def incorporate_teacher_kl(
         sampling_client: Current sampling client (shared student/teacher weights).
         renderer: Tinker renderer for building prompts.
         config: OPSD config.
+        log_path: If set, save ATIF distillation context files.
+        cycle: OPSD cycle number (for ATIF filenames).
 
     Returns:
         Metrics dict with KL statistics.
     """
     tinker = importlib.import_module("tinker")
+
+    # Save distillation privileged context (ATIF) — once per unique task.
+    if log_path:
+        logged_tasks: set[str] = set()
+        for task_name in task_names_d:
+            if task_name in logged_tasks:
+                continue
+            logged_tasks.add(task_name)
+            reflection = reflections.get(task_name, "")
+            priv_context = _PRIVILEGED_CONTEXT_TEMPLATE.format(reflection=reflection)
+            traj_log.save_distillation_context(log_path, cycle, task_name, priv_context, reflection)
 
     # Compute teacher logprobs for all datums concurrently.
     coros = []
