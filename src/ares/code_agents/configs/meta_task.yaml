@@ -12,6 +12,13 @@ agent:
 
     Read the task above carefully. You have a full Linux shell environment at `/testbed`.
 
+    ## Interaction model
+
+    This is a **multi-turn** conversation. You have up to 30 turns to complete the task.
+    Each turn you send ONE command, observe the output, then decide your next step.
+    Take it step by step: explore first, understand the code, then make targeted edits.
+    Do NOT try to plan and execute everything in a single turn.
+
     ## Response format
 
     For each response:
@@ -20,6 +27,7 @@ agent:
     2. Then provide exactly **one** ```bash code block with your command
 
     Without a ```bash code block, your command will NOT execute.
+    Do NOT include example bash blocks in your THOUGHT section — they will be parsed as commands.
 
     <example_response>
     THOUGHT: I need to understand the target function and how it's used. Let me read the file with line numbers so I can plan my edits.
