@@ -14,38 +14,36 @@ agent:
 
     ## Response format
 
-    Every response MUST include at least one bash code block. Write your commands inside
-    triple-backtick bash blocks like this:
+    For each response:
 
-    ```bash
-    cat source/utilities.js
-    ```
+    1. Start with a **THOUGHT** section explaining your reasoning, analysis, and what you plan to do
+    2. Then provide exactly **one** ```bash code block with your command
 
-    You can include reasoning text before or after the code block, but the code block is required.
-    Without it, your command will NOT execute.
+    Without a ```bash code block, your command will NOT execute.
 
-    Example of a correct response:
-
-    I'll explore the target function first.
+    <example_response>
+    THOUGHT: I need to understand the target function and how it's used. Let me read the file with line numbers so I can plan my edits.
 
     ```bash
     nl -ba source/utilities.js
     ```
+    </example_response>
 
-    Example of making an edit:
-
-    I'll change the condition on line 5.
+    <example_response>
+    THOUGHT: Looking at line 25, the condition `string[index - 1] === '\r'` checks for carriage returns. If I change the comparison from `index - 1` to `index`, it will check the wrong character position, causing CRLF handling to break in subtle ways.
 
     ```bash
-    sed -i '5s/index === -1/index === 0/' source/utilities.js
+    sed -i '25s/index - 1/index/' source/utilities.js
     ```
+    </example_response>
 
     ## Workflow
     1. Explore the codebase to understand the target code and its context
     2. Read the relevant files carefully
-    3. Make targeted edits
-    4. Verify your changes look correct
-    5. Submit when done
+    3. Plan your bug — think about what changes would cause failures
+    4. Make your edits (one command per turn, multiple turns is fine)
+    5. Verify your changes look correct
+    6. Submit when done
 
     ## Command guide
 
@@ -67,7 +65,7 @@ agent:
     Avoid overwriting entire files with `cat > file << EOF`. Prefer surgical edits.
 
     ## Rules
-    - Every response MUST include a ```bash code block — plain text commands will NOT execute
+    - Every response MUST start with THOUGHT and include exactly one ```bash code block
     - Prefer `sed -i` for edits — avoid `cat >` or heredocs that rewrite entire files
     - Do NOT revert your changes or run `git checkout`
     - Do NOT create patch files — leave your changes in the working tree
@@ -123,10 +121,12 @@ model:
     {{error}}
     </error>
 
-    You MUST wrap your commands in a ```bash code block. Example:
+    You MUST wrap your command in a ```bash code block. Example:
+
+    THOUGHT: I need to check the file contents.
 
     ```bash
-    your_command_here
+    cat source/utilities.js
     ```
 
-    Plain text commands will not execute. Always use ```bash blocks.
+    Plain text commands will not execute. Always use THOUGHT + one ```bash block.
