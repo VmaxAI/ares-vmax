@@ -16,10 +16,13 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Sequence
 import contextlib
+import datetime
 import importlib
 import logging
+import pathlib
 import random
 from typing import Any
+import uuid
 
 import ares
 from ares.containers import containers
@@ -77,6 +80,7 @@ class AresCodeTinkerEnv:
         max_trajectory_tokens: int = 32 * 1024,
         max_tokens: int = 4096,
         task_name: str = "unknown",
+        trial_log_path: pathlib.Path | None = None,
     ):
         try:  # pragma: no cover
             importlib.import_module("tinker")
@@ -91,6 +95,8 @@ class AresCodeTinkerEnv:
         self._task_name = task_name
         self._step_count = 0
         self._closed = False
+        self._trial_log_path = trial_log_path
+        self._conversation: list[dict[str, str]] = []
 
     def _fits_context_window(self, prompt_tokens: int) -> bool:
         """Return True if prompt + reserved generation tokens fits context window."""
@@ -145,6 +151,12 @@ class AresCodeTinkerEnv:
                 await asyncio.sleep(delay)
 
         self._step_count = 0
+        self._conversation = []
+
+        # Capture initial messages (system + user prompt) for trajectory logging.
+        if ts.observation is not None:
+            for msg in ts.observation.messages:
+                self._conversation.append({"role": msg["role"], "content": _get_text_content(msg)})
 
         model_input = self._ts_to_model_input(ts)
         if not self._fits_context_window(model_input.length):
@@ -169,6 +181,9 @@ class AresCodeTinkerEnv:
         # Decode assistant message using renderer.
         message, parse_success = self._renderer.parse_response(action)
         assistant_text = _get_text_content(message)
+
+        # Track assistant turn for trajectory.
+        self._conversation.append({"role": "assistant", "content": assistant_text})
 
         # Construct ARES LLMResponse.
         ares_action = response.LLMResponse(
@@ -208,6 +223,7 @@ class AresCodeTinkerEnv:
                     self._step_count,
                     reward,
                 )
+            await self._persist_trial_artifacts()
             await self._env.__aexit__(None, None, None)
             self._closed = True
             next_observation = tinker.ModelInput.empty()
@@ -232,9 +248,20 @@ class AresCodeTinkerEnv:
                 episode_done = True
                 reward = 0.0
                 next_observation = tinker.ModelInput.empty()
+                await self._persist_trial_artifacts()
                 await self._env.__aexit__(None, None, None)
                 self._closed = True
             else:
+                # Track new observation messages (tool results, etc.) for trajectory.
+                # NOTE: Assumes ts.observation.messages is append-only (new messages
+                # are appended after the existing ones).  This holds because
+                # CodeEnvironment's QueueMediatedLLMClient accumulates messages.
+                if ts.observation is not None:
+                    existing_count = len(self._conversation)
+                    all_msgs = ts.observation.messages
+                    new_msgs = all_msgs[existing_count:] if len(all_msgs) > existing_count else []
+                    for msg in new_msgs:
+                        self._conversation.append({"role": msg["role"], "content": _get_text_content(msg)})
                 _LOGGER.debug(
                     "ENV STEP  | task=%s | step=%d | tokens=%d/%d",
                     self._task_name,
@@ -252,6 +279,8 @@ class AresCodeTinkerEnv:
             metrics["bug_valid"] = float(meta.get("bug_is_valid", False))
             metrics["frontier_solved"] = float(meta.get("strong_resolved", False))
             metrics["produces_patch"] = float(meta.get("produces_patch", False))
+            metrics["no_test_mods"] = float(meta.get("no_test_modifications", False))
+            metrics["inner_task_created"] = float(meta.get("inner_task_created", False))
 
         return step_result_cls(
             reward=reward,
@@ -261,12 +290,48 @@ class AresCodeTinkerEnv:
             metrics=metrics,
         )
 
+    async def _persist_trial_artifacts(self) -> None:
+        """Download sandbox artifacts and save teacher trajectory to disk."""
+        if self._trial_log_path is None:
+            return
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        trial_dir = self._trial_log_path / f"{self._task_name}_{ts}_{uuid.uuid4().hex[:8]}"
+        trial_dir.mkdir(parents=True, exist_ok=True)
+
+        # Download sandbox artifacts (inner_task, reward.txt, meta_results.json, etc.)
+        if hasattr(self._env, "download_trial_artifacts"):
+            await self._env.download_trial_artifacts(trial_dir)
+
+        # Save teacher trajectory as markdown.
+        trajectory_md = self._format_trajectory_markdown()
+        if trajectory_md:
+            (trial_dir / "trajectory.md").write_text(trajectory_md)
+
+        _LOGGER.info("Persisted trial artifacts to %s", trial_dir)
+
+    def _format_trajectory_markdown(self) -> str:
+        """Format the captured conversation as a readable markdown document."""
+        if not self._conversation:
+            return ""
+        lines = [f"# Teacher Trajectory: {self._task_name}", f"Steps: {self._step_count}", ""]
+        for msg in self._conversation:
+            role = msg["role"].upper()
+            lines.append(f"## {role}")
+            lines.append("")
+            lines.append(msg["content"])
+            lines.append("")
+            lines.append("---")
+            lines.append("")
+        return "\n".join(lines)
+
     async def close(self) -> None:
         """Close the underlying ARES environment (idempotent)."""
         if self._closed:
             return
         self._closed = True
         _LOGGER.debug("ENV CLOSE | task=%s | step=%d", self._task_name, self._step_count)
+        with contextlib.suppress(Exception):
+            await self._persist_trial_artifacts()
         with contextlib.suppress(Exception):
             await self._env.__aexit__(None, None, None)
 
@@ -296,6 +361,7 @@ class AresEnvGroupBuilder:
         snapshot_template_name: str | None = None,
         code_agent_factory: Any | None = None,
         sandbox_env: dict[str, str] | None = None,
+        trial_log_path: pathlib.Path | None = None,
     ):
         if task is None and preset_name is None:
             raise ValueError("Either preset_name or task must be provided")
@@ -314,6 +380,7 @@ class AresEnvGroupBuilder:
         self._snapshot_template_name = snapshot_template_name
         self._code_agent_factory = code_agent_factory
         self._sandbox_env = sandbox_env
+        self._trial_log_path = trial_log_path
 
     async def make_envs(self) -> Sequence[AresCodeTinkerEnv]:
         importlib.import_module("tinker")
@@ -344,6 +411,7 @@ class AresEnvGroupBuilder:
                         max_trajectory_tokens=self._max_trajectory_tokens,
                         max_tokens=self._max_tokens,
                         task_name=task_name,
+                        trial_log_path=self._trial_log_path,
                     )
                 )
             return envs
@@ -364,6 +432,7 @@ class AresEnvGroupBuilder:
                     max_trajectory_tokens=self._max_trajectory_tokens,
                     max_tokens=self._max_tokens,
                     task_name=task_name,
+                    trial_log_path=self._trial_log_path,
                 )
             )
         return envs
@@ -413,6 +482,7 @@ class AresRLDatasetBuilder:
         snapshot_template_name: str | None = None,
         code_agent_factory: Any | None = None,
         sandbox_env: dict[str, str] | None = None,
+        trial_log_path: pathlib.Path | None = None,
     ):
         if preset_name is None and tasks is None:
             raise ValueError("Either preset_name or tasks must be provided")
@@ -433,6 +503,7 @@ class AresRLDatasetBuilder:
         self._snapshot_template_name = snapshot_template_name
         self._code_agent_factory = code_agent_factory
         self._sandbox_env = sandbox_env
+        self._trial_log_path = trial_log_path
 
     async def __call__(self) -> tuple[dataset.TerminalRLDataset, None]:
         # Resolve renderer.
@@ -453,6 +524,7 @@ class AresRLDatasetBuilder:
         snapshot_template_name = self._snapshot_template_name
         code_agent_factory = self._code_agent_factory
         sandbox_env = self._sandbox_env
+        trial_log_path = self._trial_log_path
 
         if self._injected_tasks is not None:
             # Task mode: use injected Harbor Task objects directly.
@@ -475,6 +547,7 @@ class AresRLDatasetBuilder:
                     snapshot_template_name=snapshot_template_name,
                     code_agent_factory=code_agent_factory,
                     sandbox_env=sandbox_env,
+                    trial_log_path=trial_log_path,
                 )
 
             return (
@@ -516,6 +589,7 @@ class AresRLDatasetBuilder:
                 max_trajectory_tokens=max_trajectory_tokens,
                 max_tokens=max_tokens,
                 snapshot_template_name=snapshot_template_name,
+                trial_log_path=trial_log_path,
             )
 
         return (

@@ -335,6 +335,27 @@ class CodeEnvironment(base.Environment[response.LLMResponse, request.LLMRequest 
 
         return 0.0  # Unreachable, but makes the type checker happy.
 
+    async def download_trial_artifacts(self, local_dir: pathlib.Path) -> None:
+        """Download /logs/verifier/ from sandbox to *local_dir*/verifier/.
+
+        Also persists the last test.sh stdout/stderr to *local_dir*/test_output.txt.
+        Failures are logged but never raised — callers should not depend on artifacts
+        being present (e.g., non-meta-task episodes won't have ``inner_task/``).
+        """
+        if self._container is None:
+            _LOGGER.debug("[%d] No container — skipping artifact download", id(self))
+            return
+        try:
+            await self._container.download_dir("/logs/verifier", local_dir / "verifier")
+            _LOGGER.info("[%d] Downloaded trial artifacts to %s", id(self), local_dir / "verifier")
+        except Exception as e:
+            _LOGGER.warning("[%d] Failed to download /logs/verifier/: %s: %s", id(self), type(e).__name__, e)
+        # Also persist test.sh output.
+        if self._last_test_output:
+            test_output_path = local_dir / "test_output.txt"
+            test_output_path.parent.mkdir(parents=True, exist_ok=True)
+            test_output_path.write_text(self._last_test_output)
+
     @property
     def last_test_output(self) -> str:
         """Return the stdout/stderr from the most recent test.sh execution."""

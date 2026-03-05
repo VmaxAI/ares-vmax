@@ -17,6 +17,7 @@ import importlib
 import inspect
 import logging
 import os
+import pathlib
 import random
 import time
 from typing import Any
@@ -62,9 +63,11 @@ def _log_rollout_complete(task_label: str, result: Any, num_envs: int, elapsed: 
     meta_suffix = ""
     if meta_stats:
         n = meta_stats["total"]
+        hard = meta_stats["valid"] - meta_stats["frontier_solved"]
         meta_suffix = (
             f" | patches={meta_stats['patches']}/{n}"
             f" | valid={meta_stats['valid']}/{n}"
+            f" | hard={hard}/{n}"
             f" | frontier_solved={meta_stats['frontier_solved']}/{n}"
         )
 
@@ -90,7 +93,9 @@ def _extract_meta_stats(result: Any) -> dict[str, int]:
     """
     total = 0
     patches = 0
+    no_test_mods = 0
     valid = 0
+    inner_created = 0
     frontier_solved = 0
 
     for trajectory in result.trajectories_G:
@@ -103,14 +108,70 @@ def _extract_meta_stats(result: Any) -> dict[str, int]:
         total += 1
         if last_metrics.get("produces_patch", 0.0) > 0:
             patches += 1
+        if last_metrics.get("no_test_mods", 0.0) > 0:
+            no_test_mods += 1
         if last_metrics.get("bug_valid", 0.0) > 0:
             valid += 1
+        if last_metrics.get("inner_task_created", 0.0) > 0:
+            inner_created += 1
         if last_metrics.get("frontier_solved", 0.0) > 0:
             frontier_solved += 1
 
     if total == 0:
         return {}
-    return {"total": total, "patches": patches, "valid": valid, "frontier_solved": frontier_solved}
+    return {
+        "total": total,
+        "patches": patches,
+        "no_test_mods": no_test_mods,
+        "valid": valid,
+        "inner_created": inner_created,
+        "frontier_solved": frontier_solved,
+    }
+
+
+def _aggregate_batch_meta_stats(trajectory_groups: list[Any]) -> dict[str, int]:
+    """Aggregate meta-task stats across all trajectory groups in a training batch."""
+    totals: dict[str, int] = {}
+    for group in trajectory_groups:
+        if group is None:
+            continue
+        stats = _extract_meta_stats(group)
+        if not stats:
+            continue
+        for k, v in stats.items():
+            totals[k] = totals.get(k, 0) + v
+    return totals
+
+
+def _log_meta_stats_to_wandb(meta_stats: dict[str, int]) -> None:
+    """Log aggregated meta-task pipeline stats to W&B (if active)."""
+    if not meta_stats:
+        return
+    try:
+        import wandb
+
+        if wandb.run is None:
+            return
+    except ImportError:
+        return
+
+    n = meta_stats["total"]
+    valid = meta_stats["valid"]
+    hard = valid - meta_stats["frontier_solved"]
+
+    wandb.log(
+        {
+            "meta/n_rollouts": n,
+            "meta/produces_patch_rate": meta_stats["patches"] / n,
+            "meta/empty_patch_rate": 1.0 - meta_stats["patches"] / n,
+            "meta/no_test_mods_rate": meta_stats["no_test_mods"] / n,
+            "meta/valid_bug_rate": valid / n,
+            "meta/frontier_solved_rate": meta_stats["frontier_solved"] / max(1, valid),
+            "meta/hard_bug_rate": hard / n,
+            "meta/hard_bug_count": hard,
+        },
+        commit=False,  # committed with next tinker_cookbook log call
+    )
 
 
 async def run_training(config: config_mod.TrainingConfig, tasks: list | None = None) -> None:
@@ -165,6 +226,7 @@ async def run_training(config: config_mod.TrainingConfig, tasks: list | None = N
         code_agent_factory: Any | None = None
         if config.code_agent_config_path:
             from ares.code_agents import mini_swe_agent
+
             code_agent_factory = functools.partial(
                 mini_swe_agent.MiniSWECodeAgent, config_path=config.code_agent_config_path
             )
@@ -188,6 +250,8 @@ async def run_training(config: config_mod.TrainingConfig, tasks: list | None = N
         else:
             _LOGGER.warning("No API keys found in host environment — sandbox scripts may fail")
 
+        trial_log_path = pathlib.Path(config.log_path) / "trials" if config.log_path else None
+
         if tasks is not None:
             # Task-based builder: demiurge-swe injects Harbor Task objects directly.
             _LOGGER.info("Using %d injected tasks with code-agent harness", len(tasks))
@@ -205,6 +269,7 @@ async def run_training(config: config_mod.TrainingConfig, tasks: list | None = N
                 snapshot_template_name=config.snapshot_template_name,
                 code_agent_factory=code_agent_factory,
                 sandbox_env=sandbox_env or None,
+                trial_log_path=trial_log_path,
             )
         else:
             # Preset-based builder: tasks from ARES registry.
@@ -224,6 +289,7 @@ async def run_training(config: config_mod.TrainingConfig, tasks: list | None = N
                 snapshot_template_name=config.snapshot_template_name,
                 code_agent_factory=code_agent_factory,
                 sandbox_env=sandbox_env or None,
+                trial_log_path=trial_log_path,
             )
     else:
         # Terminal harness (default) — tmux + JSON commands.
@@ -447,7 +513,25 @@ async def run_training(config: config_mod.TrainingConfig, tasks: list | None = N
             sampling_client = await training_client.save_weights_and_get_sampling_client_async()
             return sampling_client, {}
 
-        _LOGGER.info("TRAIN STEP | training on %d groups", len(trajectory_groups))
+        # Log aggregated meta-task pipeline stats to W&B before the train step.
+        # commit=False so they're committed alongside tinker_cookbook's training metrics.
+        batch_meta = _aggregate_batch_meta_stats(trajectory_groups)
+        if batch_meta:
+            n = batch_meta["total"]
+            _LOGGER.info(
+                "TRAIN STEP | training on %d groups | meta: patches=%d/%d valid=%d/%d hard=%d/%d",
+                len(trajectory_groups),
+                batch_meta["patches"],
+                n,
+                batch_meta["valid"],
+                n,
+                batch_meta["valid"] - batch_meta["frontier_solved"],
+                n,
+            )
+        else:
+            _LOGGER.info("TRAIN STEP | training on %d groups", len(trajectory_groups))
+        _log_meta_stats_to_wandb(batch_meta)
+
         return await _original_do_train_step(*bound.args, **bound.kwargs)
 
     tinker_train.do_train_step_and_get_sampling_client = _safe_do_train_step  # type: ignore[assignment]
