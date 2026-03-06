@@ -1,11 +1,20 @@
 # ARES Tinker Integration
 
-RL training for code agents using [Tinker](https://tinker.build) + ARES's [Harbor](https://github.com/withmartian/harbor) task system. Supports two harness modes through a single CLI entry point (`examples/06_tinker_terminal_train.py`).
+RL training for code agents using [Tinker](https://tinker.build) + ARES's [Harbor](https://github.com/withmartian/harbor) task system. Two recipes and two harness modes.
+
+## Recipes
+
+| Recipe | Entry Point | Docs | Description |
+|--------|-------------|------|-------------|
+| **RL** | `examples/06_tinker_rl_train.py` | [`rl/README.md`](rl/README.md) | Standard GRPO-style RL training (sync or async) |
+| **OPSD** | `examples/07_tinker_opsd_train.py` | [`opsd/README.md`](opsd/README.md) | On-Policy Self-Distillation — iterative phasic training with self-reflection and reverse-KL distillation |
+
+## Harness Modes
 
 | Harness | Flag | Environment | Best For |
 |---------|------|-------------|----------|
-| Terminal | `--harness terminal` (default) | tmux + JSON commands | Terminus2-style terminal/devops tasks |
-| Code-agent | `--harness code-agent` | ARES CodeEnvironment + QueueMediatedLLMClient | Mini-SWE-Agent, any ARES agent on any preset |
+| Terminal | `--harness terminal` (default for RL) | tmux + JSON commands | Terminus2-style terminal/devops tasks |
+| Code-agent | `--harness code-agent` (default for OPSD) | ARES CodeEnvironment + QueueMediatedLLMClient | Mini-SWE-Agent, any ARES agent on any preset |
 
 ## Prerequisites
 
@@ -21,220 +30,59 @@ export DAYTONA_API_KEY="..."       # Required when using --env daytona (default)
 export WANDB_API_KEY="..."         # Weights & Biases logging
 ```
 
-## Quick Start
+## Architecture
 
-### Single task verification (terminal harness)
+```
+src/ares/tinker_integration/
+├── __init__.py                    Public API re-exports
+├── config.py                      TrainingConfig dataclass (shared)
+├── dataset.py                     Multi-task dataset layer (shared)
+├── terminal_env.py                AsyncTerminalGymEnv — gym-like terminal wrapper
+├── tinker_env.py                  HarborTerminalTinkerEnv — terminal harness adapter
+├── ares_env.py                    AresCodeTinkerEnv — code-agent harness adapter
+├── create_snapshots.py            Bulk Daytona snapshot creation
+├── monkey_patches.py              MonkeyPatchContext — shared monkey-patches
+├── train.py                       Backward-compat shim (delegates to rl.train)
+│
+├── rl/
+│   ├── __init__.py
+│   ├── train.py                   run_training() — standard RL entry point
+│   └── README.md
+│
+└── opsd/
+    ├── __init__.py
+    ├── config.py                  OPSDConfig — extends TrainingConfig
+    ├── train.py                   run_opsd_training() — iterative phasic orchestrator
+    ├── evaluation.py              Student/teacher evaluation phases
+    ├── reflection.py              Self-reflection from failed traces
+    ├── privileged_env.py          Env wrappers injecting privileged context
+    ├── distillation.py            Reverse KL computation + teacher logprobs
+    └── README.md
 
-```bash
-uv run python examples/06_tinker_terminal_train.py \
-    --task-dir path/to/harbor_task \
-    --model-name Qwen/Qwen3-4B-Instruct-2507 \
-    --renderer-name qwen3 \
-    --log-path ./runs/verify \
-    --env docker
+examples/
+├── 06_tinker_rl_train.py          RL recipe CLI entry point
+└── 07_tinker_opsd_train.py        OPSD recipe CLI entry point
 ```
 
-### Multi-task training from ARES preset
+## Shared Monkey-Patches
 
-```bash
-uv run python examples/06_tinker_terminal_train.py \
-    --preset sbv-terminus2 \
-    --num-tasks 20 \
-    --model-name Qwen/Qwen3-4B-Instruct-2507 \
-    --renderer-name qwen3 \
-    --log-path ./runs/sbv_multi \
-    --env daytona \
-    --wandb-project ares-tinker
-```
+Both recipes apply the same set of monkey-patches via `MonkeyPatchContext`:
 
-### With Daytona snapshots (faster sandbox creation)
+1. **wandb config.update** — Allow value changes (duplicate-key workaround).
+2. **optim_step** — Gradient clipping via `AdamParams.grad_clip_norm`.
+3. **do_group_rollout_and_filter** — Retry on transient sandbox errors (exponential backoff).
+4. **remove_constant_reward_groups** — Filter `None` trajectory groups.
+5. **do_train_step** — Skip empty batches, filter `None` groups from builders.
+6. **do_group_rollout** — Close sandboxes on failure + prevent wrapper chaining.
 
-```bash
-# Step 1: Pre-create snapshots (run once)
-uv run python -m ares.tinker_integration.create_snapshots \
-    --preset sbv-terminus2 \
-    --template "ares__{name}" \
-    --num-tasks 50 \
-    --concurrency 25
-
-# Step 2: Train with --snapshot-template
-uv run python examples/06_tinker_terminal_train.py \
-    --preset sbv-terminus2 \
-    --num-tasks 50 \
-    --snapshot-template "ares__{name}" \
-    --model-name Qwen/Qwen3-4B-Instruct-2507 \
-    --renderer-name qwen3 \
-    --log-path ./runs/sbv_snap \
-    --env daytona \
-    --group-size 6 \
-    --groups-per-batch 32 \
-    --num-batches 50 \
-    --wandb-project ares-tinker
-```
-
-### Code-agent harness (Mini-SWE-Agent)
-
-```bash
-uv run python examples/06_tinker_terminal_train.py \
-    --harness code-agent \
-    --preset sbv-mswea \
-    --num-tasks 20 \
-    --model-name Qwen/Qwen3-4B-Instruct-2507 \
-    --renderer-name qwen3 \
-    --log-path ./runs/sbv_mswea \
-    --env daytona \
-    --max-tokens 4096
-```
-
-## Training Results
-
-Results from async CISPO training on 50 SWE-bench Verified Terminus2 tasks (`sbv-terminus2` preset) with `Qwen/Qwen3-4B-Instruct-2507`, using Daytona sandboxes with snapshots. Training command:
-
-```bash
-uv run python examples/06_tinker_terminal_train.py \
-    --preset sbv-terminus2 \
-    --num-tasks 50 \
-    --model-name Qwen/Qwen3-4B-Instruct-2507 \
-    --renderer-name qwen3 \
-    --log-path ./runs/sbv_terminus2_snap_async_cispo \
-    --env daytona \
-    --snapshot-template "ares__{name}" \
-    --max-steps-off-policy 3 \
-    --loss-fn cispo \
-    --learning-rate 4e-5 \
-    --lora-rank 32 \
-    --group-size 6 \
-    --groups-per-batch 32 \
-    --num-batches 50 \
-    --max-tokens 4096 \
-    --wandb-project ares-tinker \
-    --wandb-name "sbv-terminus2-snap-async-cispo"
-```
-
-### Aggregate reward across all tasks
-
-The average reward increases over training steps, showing the model is learning to solve tasks:
-
-![Aggregate reward over training steps](assets/reward_all_tasks.png)
-
-### Per-task reward curves
-
-Some tasks show clear learning (reward climbing from 0 to 0.6-0.8):
-
-![Tasks with successful learning curves](assets/reward_good_tasks.png)
-
-Other tasks remain unsolved throughout training (flat at 0), which is expected — not all SWE-bench tasks are solvable by a 4B model:
-
-![Tasks that remained unsolved](assets/reward_bad_tasks.png)
-
-## Creating Snapshots
-
-Snapshots are pre-built Daytona sandbox images that skip the declarative build step, making sandbox creation much faster. They are optional — omit `--snapshot-template` to use standard image builds.
-
-```bash
-uv run python -m ares.tinker_integration.create_snapshots \
-    --preset sbv-terminus2 \
-    --template "ares__{name}" \
-    --num-tasks 20 \
-    --concurrency 5 \
-    --force-recreate  # optional: re-create existing snapshots
-```
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--preset` | (required) | ARES preset name |
-| `--template` | (required) | Snapshot name template, must contain `{name}` |
-| `--num-tasks` | all | Limit number of tasks |
-| `--concurrency` | `5` | Max concurrent snapshot creations |
-| `--force-recreate` | `false` | Re-create even if active snapshot exists |
-
-Template convention: `"ares__{name}"` — double underscore separates prefix from task name. Resources (CPU, memory, disk) are baked into the snapshot at creation time from the task config.
-
-## Training Modes
-
-### Sync (default, recommended)
-
-On-policy training. All rollouts in a batch complete before the gradient step. Proven to work well (~2h for single-task, smooth learning curve).
-
-```bash
-uv run python examples/06_tinker_terminal_train.py \
-    --preset sbv-terminus2 \
-    --num-tasks 50 \
-    --snapshot-template "ares__{name}" \
-    --model-name Qwen/Qwen3-4B-Instruct-2507 \
-    --renderer-name qwen3 \
-    --log-path ./runs/sbv_sync \
-    --env daytona \
-    --group-size 6 \
-    --groups-per-batch 32 \
-    --num-batches 50 \
-    --wandb-project ares-tinker \
-    --wandb-name "sbv-terminus2-sync"
-```
-
-### Async (experimental)
-
-Off-policy training with parallel rollout workers. Pass `--max-steps-off-policy` to enable. Higher throughput but requires careful tuning.
-
-```bash
-uv run python examples/06_tinker_terminal_train.py \
-    --preset sbv-terminus2 \
-    --num-tasks 50 \
-    --snapshot-template "ares__{name}" \
-    --model-name Qwen/Qwen3-4B-Instruct-2507 \
-    --renderer-name qwen3 \
-    --log-path ./runs/sbv_async \
-    --env daytona \
-    --max-steps-off-policy 3 \
-    --loss-fn cispo \
-    --group-size 6 \
-    --groups-per-batch 32 \
-    --num-batches 50 \
-    --wandb-project ares-tinker \
-    --wandb-name "sbv-terminus2-async"
-```
-
-## Resuming Training
-
-### From a checkpoint
-
-```bash
-uv run python examples/06_tinker_terminal_train.py \
-    --preset sbv-terminus2 \
-    --model-name Qwen/Qwen3-4B-Instruct-2507 \
-    --renderer-name qwen3 \
-    --log-path ./runs/sbv_resumed \
-    --env daytona \
-    --load-checkpoint-path ./runs/sbv_sync/checkpoints/batch_10
-```
-
-### Resuming a WandB run
-
-To continue logging to a previous WandB run (e.g., after a crash or checkpoint resume), set `WANDB_RESUME` and `WANDB_RUN_ID` environment variables. The run ID is shown in the WandB UI or in the initial training logs.
-
-```bash
-WANDB_RESUME=must WANDB_RUN_ID=<previous-run-id> \
-uv run python examples/06_tinker_terminal_train.py \
-    --preset sbv-terminus2 \
-    --model-name Qwen/Qwen3-4B-Instruct-2507 \
-    --renderer-name qwen3 \
-    --log-path ./runs/sbv_resumed \
-    --env daytona \
-    --load-checkpoint-path ./runs/sbv_sync/checkpoints/batch_10 \
-    --wandb-project ares-tinker \
-    --wandb-name "sbv-experiment-1"
-```
-
-`WANDB_RESUME=must` requires the run to already exist (fails if not found). Use `WANDB_RESUME=allow` to create a new run if the ID doesn't exist.
-
-## CLI Reference
+## Shared CLI Reference
 
 ### Task Source (mutually exclusive, one required)
 
 | Flag | Description |
 |------|-------------|
 | `--task-dir PATH` | Single Harbor task directory (terminal harness only) |
-| `--preset NAME` | ARES preset name (e.g., `sbv-terminus2`, `tbench-terminus2`) |
+| `--preset NAME` | ARES preset name (e.g., `sbv-mswea`, `tbench-terminus2`) |
 | `--num-tasks N` | Limit number of tasks loaded from preset |
 
 ### Environment
@@ -247,7 +95,7 @@ uv run python examples/06_tinker_terminal_train.py \
 | `--sandbox-memory-gb` | task default | RAM (GB) per sandbox |
 | `--sandbox-disk-gb` | task default | Disk (GB) per sandbox |
 | `--snapshot-template` | none | Snapshot template with `{name}` placeholder |
-| `--max-concurrent-sandboxes` | `20` | Cap concurrent sandbox creations (0 = no limit) |
+| `--max-concurrent-sandboxes` | `0` | Cap concurrent sandbox creations (0 = no limit) |
 
 ### Model
 
@@ -276,7 +124,6 @@ uv run python examples/06_tinker_terminal_train.py \
 | `--loss-fn` | `importance_sampling` | Loss function (`importance_sampling`, `ppo`, `cispo`) |
 | `--grad-clip-norm` | `0.5` | Gradient clipping norm |
 | `--kl-penalty-coef` | `0.0` | KL penalty coefficient (0 = disabled) |
-| `--remove-constant-reward-groups` | `false` | Filter groups where all rollouts got the same reward |
 
 ### Async Training
 
@@ -298,99 +145,20 @@ uv run python examples/06_tinker_terminal_train.py \
 | `--base-url` | none | Tinker service URL override |
 | `--load-checkpoint-path` | none | Resume from checkpoint |
 
-## Harness Modes
+## Creating Snapshots
 
-### Terminal harness (default)
-
-The model controls a tmux terminal session directly via JSON commands:
-
-```json
-{"commands": [{"keystrokes": "ls -la\n", "duration": 3}], "task_complete": false}
+```bash
+uv run python -m ares.tinker_integration.create_snapshots \
+    --preset sbv-terminus2 \
+    --template "ares__{name}" \
+    --num-tasks 50 \
+    --concurrency 25
 ```
-
-- Each turn: model sees terminal output, generates JSON with keystrokes
-- Episode ends on `task_complete: true` or context window exhaustion (`too_long`)
-- Reward from Harbor Verifier at episode end
-- Context overflow terminates the episode with reward=0 (prevents infinite rollouts)
-
-### Code-agent harness
-
-Wraps ARES's `CodeEnvironment` with `QueueMediatedLLMClient`. The agent (Mini-SWE-Agent, Terminus2, etc.) runs naturally while LLM calls are intercepted and exposed as RL observations.
-
-- Requires `--preset` (not `--task-dir`)
-- Works with any ARES agent harness
-- Episode ends on step limit (250), `task_complete`, or context overflow
-- Context overflow terminates the episode with reward=0 (`too_long`), same as the terminal harness
-
-## Architecture
-
-```
-examples/06_tinker_terminal_train.py     CLI entry point (argparse)
-    |
-    v
-ares.tinker_integration.train            Orchestration + monkey-patches
-    |                                    - grad clipping (optim_step)
-    |                                    - error-resilient rollouts (retry + cleanup)
-    |                                    - None filtering + empty-batch skip
-    |                                    - wandb config fix
-    v
-ares.tinker_integration.dataset          Multi-task dataset layer
-    |                                    - TerminalRLDatasetBuilder / AresRLDatasetBuilder
-    |                                    - Task loading from presets or directories
-    |                                    - GRPO group builders with builder buffer
-    v
-ares.tinker_integration.tinker_env       Tinker adapter (terminal harness)
-    |          or .ares_env              Tinker adapter (code-agent harness)
-    |                                    - Token-level RL interface
-    |                                    - JSON command parsing / QueueMediatedLLMClient
-    v
-ares.tinker_integration.terminal_env     Gym-like terminal environment
-    |                                    - AsyncTerminalGymEnv
-    |                                    - Tmux session management
-    |                                    - Harbor Verifier for rewards
-    v
-Harbor EnvironmentFactory                Sandbox lifecycle (Daytona / Docker)
-    v
-tinker_cookbook.rl.train                  RL training loop (GRPO, PPO, IS, CISPO)
-```
-
-### RL Loop (terminal harness)
-
-1. **Reset**: Create sandbox, start tmux, capture initial terminal state
-2. **Observe**: Render message history into model input tokens via renderer
-3. **Act**: Model generates JSON `{commands: [{keystrokes, duration}], task_complete}`
-4. **Execute**: Send keystrokes to tmux, wait for output
-5. **Repeat** until `task_complete: true` or context window exhausted
-6. **Reward**: Harbor Verifier checks task completion inside the sandbox
-7. **Train**: GRPO-style advantage estimation across the group, then gradient step
 
 ## Error Resilience
 
-The training loop survives transient infrastructure failures through several mechanisms:
-
-**Rollout retries**: Individual rollout failures (Daytona rate limits, connection errors, sandbox conflicts) are retried with exponential backoff up to `--async-rollout-retries` attempts. If all retries fail, the group returns `None` and training continues with remaining successful rollouts.
-
-**Empty batch guard**: When all rollouts in a batch fail, the train step is skipped entirely (no weight update). Training proceeds to the next batch.
-
-**Sandbox cleanup**: Failed rollouts close their sandboxes immediately via a tracking wrapper on `make_envs`. Prevents Daytona sandbox leaks.
-
-**Wrapper chaining prevention**: The `make_envs` wrapper is saved/restored in a `finally` block to prevent wrapper chain growth when async mode requeues stale builders.
-
-**Verification resilience**: Harbor's `Verifier.verify()` can throw `AddTestsDirError` / `DownloadVerifierDirError` under Daytona file API load (thundering herd with snapshots). The `_safe_verify()` method retries 3x with backoff; if all fail, returns reward=0 instead of crashing the group.
-
-**Context overflow handling**: When the context window fills up, the terminal harness terminates the episode with `episode_done=True` and `reward=0` (`too_long=1.0` metric). This prevents infinite rollouts that would block gradient steps.
-
-**Gradient clipping**: All gradient updates use configurable norm clipping (default 0.5) to prevent training instability from outlier gradients.
-
-## Module Reference
-
-| File | Purpose |
-|------|---------|
-| `config.py` | `TrainingConfig` dataclass — all training parameters with validation |
-| `train.py` | `run_training()` entry point — orchestration, monkey-patches, config wiring |
-| `dataset.py` | `TerminalRLDatasetBuilder` — multi-task dataset, task loading, GRPO group builders |
-| `terminal_env.py` | `AsyncTerminalGymEnv` — gym-like wrapper over Harbor + tmux with reward verification |
-| `tinker_env.py` | `HarborTerminalTinkerEnv` — tinker-cookbook RL adapter for terminal harness |
-| `ares_env.py` | `AresCodeTinkerEnv` + `AresRLDatasetBuilder` — code-agent harness adapter |
-| `create_snapshots.py` | `create_snapshots()` — bulk Daytona snapshot creation CLI |
-| `__init__.py` | Public API re-exports |
+**Rollout retries**: Transient errors retried with exponential backoff (up to `--async-rollout-retries`).
+**Empty batch guard**: Batches where all rollouts fail are skipped (no weight update).
+**Sandbox cleanup**: Failed rollouts close sandboxes immediately.
+**Context overflow**: Episodes terminate with `reward=0` and `too_long=1.0`.
+**Verification resilience**: Harbor verify retried 3x with backoff, fallback to `reward=0`.

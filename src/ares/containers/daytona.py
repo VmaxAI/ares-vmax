@@ -79,10 +79,24 @@ async def _download_files_with_retry(sbx: daytona.AsyncSandbox, files: list[dayt
         raise
 
 
+def _should_retry_exec(retry_state: tenacity.RetryCallState) -> bool:
+    """Retry DaytonaErrors, but stop early for sandbox-gone errors."""
+    exc = retry_state.outcome.exception() if retry_state.outcome else None
+    if exc is None:
+        return False
+    if not isinstance(exc, daytona.common.errors.DaytonaError):
+        return False
+    # Don't retry if the sandbox itself is gone — it won't recover.
+    if isinstance(exc, daytona.common.errors.DaytonaNotFoundError):
+        return False
+    msg = str(exc).lower()
+    return "not found" not in msg and "no such container" not in msg and "unauthorized" not in msg
+
+
 @tenacity.retry(
-    retry=tenacity.retry_if_exception_type(daytona.common.errors.DaytonaError),
-    stop=tenacity.stop_after_attempt(10),
-    wait=tenacity.wait_exponential_jitter(max=60),
+    retry=_should_retry_exec,
+    stop=tenacity.stop_after_attempt(5),
+    wait=tenacity.wait_exponential_jitter(max=30),
     before_sleep=tenacity.before_sleep_log(_LOGGER, logging.INFO),
 )
 async def _exec_with_retry(

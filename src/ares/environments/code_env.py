@@ -331,8 +331,10 @@ class CodeEnvironment(base.Environment[response.LLMResponse, request.LLMRequest 
 
     async def _compute_reward_inner(self) -> float:
         """Run tests and compute the reward for the current episode."""
-        assert self._container is not None
-        assert self._current_task is not None
+        if self._container is None:
+            raise RuntimeError("Container is no longer available (destroyed during cleanup).")
+        if self._current_task is None:
+            raise RuntimeError("Task is no longer available.")
 
         _LOGGER.debug("[%d] Uploading tests to container.", id(self))
         await self._container.upload_dir(

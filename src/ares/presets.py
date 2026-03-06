@@ -30,8 +30,9 @@ _LOGGER = logging.getLogger(__name__)
 
 def _make_harbor_dataset_id(name: str, version: str) -> str:
     """Small helper to make a shorter Dataset ID from the Harbor name and version"""
-    if name == "swe-lancer-diamond":
-        name = f"swe-lancer-diamond-{version}"
+    if name in ("swe-lancer-diamond", "kumo"):
+        sanitized_version = version.replace(".", "_")
+        name = f"{name}-{sanitized_version}"
 
     return name.replace("swebench-verified", "sbv").replace("terminal-bench", "tbench")
 
