@@ -84,12 +84,17 @@ def _log_rollout_complete(task_label: str, result: Any, num_envs: int, elapsed: 
     )
 
 
-def _extract_meta_stats(result: Any) -> dict[str, int]:
+def _extract_meta_stats(result: Any) -> dict[str, float]:
     """Extract aggregate meta-task stats from trajectory metrics.
 
     Looks for ``bug_valid``, ``frontier_solved``, ``produces_patch`` in the
-    final step metrics of each trajectory. Returns empty dict if no meta
+    final step metrics of each trajectory. Also collects rubric axis pass counts
+    and holistic quality score sums when available. Returns empty dict if no meta
     metrics are found (non-meta-task rollout).
+
+    All values are raw counts or sums — rates/averages are computed only at
+    logging time in ``_log_meta_stats_to_wandb`` to avoid incorrect aggregation
+    when summing across groups.
     """
     total = 0
     patches = 0
@@ -97,6 +102,13 @@ def _extract_meta_stats(result: Any) -> dict[str, int]:
     valid = 0
     inner_created = 0
     frontier_solved = 0
+    # Rubric metrics: raw counts for correct aggregation across groups.
+    rubric_axis_passes: dict[str, int] = {}
+    rubric_axis_totals: dict[str, int] = {}
+    rubric_quality_sum = 0.0
+    rubric_quality_count = 0
+    rubric_reward_sum = 0.0
+    rubric_reward_count = 0
 
     for trajectory in result.trajectories_G:
         if not trajectory.transitions:
@@ -116,10 +128,24 @@ def _extract_meta_stats(result: Any) -> dict[str, int]:
             inner_created += 1
         if last_metrics.get("frontier_solved", 0.0) > 0:
             frontier_solved += 1
+        # Rubric axis pass/fail metrics (keyed as rubric_axis_<name>)
+        for key, val in last_metrics.items():
+            if key.startswith("rubric_axis_"):
+                rubric_axis_totals[key] = rubric_axis_totals.get(key, 0) + 1
+                if val > 0:
+                    rubric_axis_passes[key] = rubric_axis_passes.get(key, 0) + 1
+        hqs = last_metrics.get("rubric_holistic_quality_score")
+        if hqs is not None:
+            rubric_quality_sum += hqs
+            rubric_quality_count += 1
+        rs = last_metrics.get("rubric_score")
+        if rs is not None:
+            rubric_reward_sum += rs
+            rubric_reward_count += 1
 
     if total == 0:
         return {}
-    return {
+    stats: dict[str, float] = {
         "total": total,
         "patches": patches,
         "no_test_mods": no_test_mods,
@@ -127,11 +153,25 @@ def _extract_meta_stats(result: Any) -> dict[str, int]:
         "inner_created": inner_created,
         "frontier_solved": frontier_solved,
     }
+    # Store raw counts for rubric axes (rates computed at log time)
+    for key, axis_total in rubric_axis_totals.items():
+        stats[f"{key}_passes"] = rubric_axis_passes.get(key, 0)
+        stats[f"{key}_total"] = axis_total
+    if rubric_quality_count > 0:
+        stats["rubric_quality_sum"] = rubric_quality_sum
+        stats["rubric_quality_count"] = rubric_quality_count
+    if rubric_reward_count > 0:
+        stats["rubric_reward_sum"] = rubric_reward_sum
+        stats["rubric_reward_count"] = rubric_reward_count
+    return stats
 
 
-def _aggregate_batch_meta_stats(trajectory_groups: list[Any]) -> dict[str, int]:
-    """Aggregate meta-task stats across all trajectory groups in a training batch."""
-    totals: dict[str, int] = {}
+def _aggregate_batch_meta_stats(trajectory_groups: list[Any]) -> dict[str, float]:
+    """Aggregate meta-task stats across all trajectory groups in a training batch.
+
+    All values are raw counts/sums so simple addition is correct.
+    """
+    totals: dict[str, float] = {}
     for group in trajectory_groups:
         if group is None:
             continue
@@ -143,7 +183,7 @@ def _aggregate_batch_meta_stats(trajectory_groups: list[Any]) -> dict[str, int]:
     return totals
 
 
-def _log_meta_stats_to_wandb(meta_stats: dict[str, int]) -> None:
+def _log_meta_stats_to_wandb(meta_stats: dict[str, float]) -> None:
     """Log aggregated meta-task pipeline stats to W&B (if active)."""
     if not meta_stats:
         return
@@ -159,19 +199,35 @@ def _log_meta_stats_to_wandb(meta_stats: dict[str, int]) -> None:
     valid = meta_stats["valid"]
     hard = valid - meta_stats["frontier_solved"]
 
-    wandb.log(
-        {
-            "meta/n_rollouts": n,
-            "meta/produces_patch_rate": meta_stats["patches"] / n,
-            "meta/empty_patch_rate": 1.0 - meta_stats["patches"] / n,
-            "meta/no_test_mods_rate": meta_stats["no_test_mods"] / n,
-            "meta/valid_bug_rate": valid / n,
-            "meta/frontier_solved_rate": meta_stats["frontier_solved"] / max(1, valid),
-            "meta/hard_bug_rate": hard / n,
-            "meta/hard_bug_count": hard,
-        },
-        commit=False,  # committed with next tinker_cookbook log call
-    )
+    log_data: dict[str, float] = {
+        "meta/n_rollouts": n,
+        "meta/produces_patch_rate": meta_stats["patches"] / n,
+        "meta/empty_patch_rate": 1.0 - meta_stats["patches"] / n,
+        "meta/no_test_mods_rate": meta_stats["no_test_mods"] / n,
+        "meta/valid_bug_rate": valid / n,
+        "meta/frontier_solved_rate": meta_stats["frontier_solved"] / max(1, valid),
+        "meta/hard_bug_rate": hard / n,
+        "meta/hard_bug_count": hard,
+    }
+
+    # Rubric metrics — compute rates from raw counts
+    for key, val in meta_stats.items():
+        if key.endswith("_total") and key.startswith("rubric_axis_"):
+            # rubric_axis_realism_total → realism
+            axis_name = key.removeprefix("rubric_axis_").removesuffix("_total")
+            passes_key = f"rubric_axis_{axis_name}_passes"
+            axis_total = val
+            axis_passes = meta_stats.get(passes_key, 0)
+            if axis_total > 0:
+                log_data[f"meta/rubric/{axis_name}_pass_rate"] = axis_passes / axis_total
+    rubric_quality_count = meta_stats.get("rubric_quality_count", 0)
+    if rubric_quality_count > 0:
+        log_data["meta/rubric/holistic_quality_avg"] = meta_stats["rubric_quality_sum"] / rubric_quality_count
+    rubric_reward_count = meta_stats.get("rubric_reward_count", 0)
+    if rubric_reward_count > 0:
+        log_data["meta/rubric/reward_avg"] = meta_stats["rubric_reward_sum"] / rubric_reward_count
+
+    wandb.log(log_data, commit=False)  # committed with next tinker_cookbook log call
 
 
 async def run_training(config: config_mod.TrainingConfig, tasks: list | None = None) -> None:

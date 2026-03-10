@@ -347,6 +347,17 @@ class HarborTerminalTinkerEnv:
             metrics["bug_valid"] = float(meta.get("bug_is_valid", False))
             metrics["frontier_solved"] = float(meta.get("strong_resolved", False))
             metrics["produces_patch"] = float(meta.get("produces_patch", False))
+            metrics["no_test_mods"] = float(meta.get("no_test_modifications", False))
+            # Rubric metrics (written by test.sh from rubric_result.json)
+            for key, val in meta.items():
+                if key.startswith("rubric_axis_"):
+                    metrics[key] = float(bool(val))
+            hqs = meta.get("rubric_holistic_quality_score")
+            if hqs is not None:
+                metrics["rubric_holistic_quality_score"] = float(hqs)
+            rs = meta.get("rubric_score")
+            if rs is not None:
+                metrics["rubric_score"] = float(rs)
 
         return step_result_cls(
             reward=reward,
